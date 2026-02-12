@@ -27,17 +27,23 @@ def get_kimicc_home() -> Path:
     if "KIMICC_HOME" in os.environ:
         return Path(os.environ["KIMICC_HOME"])
 
-    # Try to find from package location
+    # Try to find from package location by walking up until we find config/litellm.yaml
     try:
         import kimicc
-        return Path(kimicc.__file__).parent.parent
+        candidate = Path(kimicc.__file__).parent  # src/kimicc/
+        for _ in range(4):
+            candidate = candidate.parent
+            if (candidate / "config" / "litellm.yaml").exists():
+                return candidate
     except Exception:
         pass
 
     # Fallback to script location
-    script_dir = Path(__file__).parent.parent.parent
-    if (script_dir / "config" / "litellm.yaml").exists():
-        return script_dir
+    script_dir = Path(__file__).parent  # src/kimicc/
+    for _ in range(4):
+        script_dir = script_dir.parent
+        if (script_dir / "config" / "litellm.yaml").exists():
+            return script_dir
 
     raise RuntimeError("Cannot find kimicc installation. Set KIMICC_HOME environment variable.")
 
@@ -216,8 +222,6 @@ unset CLAUDE_CODE_USE_FOUNDRY
 export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
 export CLAUDE_CODE_SKIP_VERTEX_AUTH=1
 export CLAUDE_CODE_SKIP_FOUNDRY_AUTH=1
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
 export CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING=1
 """
 
@@ -346,7 +350,7 @@ Environment Variables:
   AWS_PROFILE          AWS profile for Bedrock access
   CLAUDE_CODE_ARGS     Default arguments passed to Claude
 
-For more information: https://github.com/alonb/kimicc
+For more information: https://github.com/jswift24/kimicc
 """)
 
 
@@ -435,7 +439,7 @@ def main() -> None:
         time.sleep(1)
         start_litellm(kimicc_home, DEFAULT_HOST, DEFAULT_LITELLM_PORT, aws_profile)
         start_shim(kimicc_home, DEFAULT_HOST, DEFAULT_SHIM_PORT, DEFAULT_LITELLM_PORT)
-        print_env_help(kimicc_home)
+        launch_claude(claude_args)
         return
 
     # Start services

@@ -37,9 +37,9 @@ test = [
 kimicc = "kimicc.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/alonb/kimicc"
-Repository = "https://github.com/alonb/kimicc"
-Issues = "https://github.com/alonb/kimicc/issues"
+Homepage = "https://github.com/jswift24/kimicc"
+Repository = "https://github.com/jswift24/kimicc"
+Issues = "https://github.com/jswift24/kimicc/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kimicc"]

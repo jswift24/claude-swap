@@ -1,12 +1,12 @@
 # Kimicc
 
-A bridge that lets you use Claude Code CLI with Kimi K2.5 (via AWS Bedrock) as the AI backend.
+A bridge that lets you use Claude Code CLI with [Kimi K2.5](https://www.kimi.com/ai-models/kimi-k2-5) on [AWS Bedrock](https://aws.amazon.com/bedrock/) as the AI backend.
 
 ## Quick Start
 
 ```bash
 # Install
-pip install git+https://github.com/alonb/kimicc
+pip install git+https://github.com/jswift24/kimicc
 
 # Configure AWS credentials
 export AWS_PROFILE=bedrock-kimi
@@ -25,31 +25,72 @@ kimicc -- --dangerously-skip-permissions
 
 If you're working on the kimicc source code or prefer a local install:
 
-### 1. Clone and Install
+### 1. Install with pipx (Recommended)
+
+pipx installs Python CLI tools in isolated environments while making them available globally:
 
 ```bash
+# Install pipx if needed
+sudo apt install pipx
+pipx ensurepath
+
+# Install kimicc
+cd ~/kimicc
+pipx install -e .
+
+# kimicc is now available everywhere
+kimicc --help
+```
+
+### Alternative: Use Existing Virtual Environment
+
+If you have an existing venv (e.g., from cc-kimi):
+
+```bash
+source /path/to/.venv/bin/activate
 cd ~/kimicc
 pip install -e .
 ```
 
-This installs the `kimicc` command globally on your system.
+Note: You'll need to activate the venv before running kimicc.
 
 ### 2. Configure AWS Credentials
 
 Kimi K2.5 requires AWS Bedrock access. Choose one method:
 
 **Option A: AWS Profile (recommended)**
+
+An AWS profile stores your credentials in `~/.aws/credentials` and `~/.aws/config`. To create one:
+
 ```bash
+# Configure a new profile named "bedrock-kimi"
+aws configure --profile bedrock-kimi
+# Enter your AWS Access Key ID, Secret Access Key, region (e.g., us-east-1), and output format
+
+# Then set the environment variable
 export AWS_PROFILE=bedrock-kimi
 ```
 
+See [AWS docs on creating profiles](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) for more details.
+
 **Option B: Direct credentials**
+
+To get your AWS Access Key ID and Secret Access Key:
+
+1. Log in to the [AWS IAM Console](https://console.aws.amazon.com/iam/)
+2. Navigate to **Users** → select your user → **Security credentials** tab
+3. Click **Create access key** (or use an existing one)
+4. Copy the Access Key ID and Secret Access Key (the secret is only shown once)
+
+See [AWS docs on access keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html) for more information.
+
 ```bash
 export AWS_ACCESS_KEY_ID=your_key
 export AWS_SECRET_ACCESS_KEY=your_secret
 ```
 
 **Option C: Temporary session token**
+
 ```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
@@ -67,6 +108,7 @@ kimicc
 ```
 
 Or install litellm globally:
+
 ```bash
 pip install litellm
 ```
@@ -88,7 +130,7 @@ kimicc --stop
 
 ## What is Kimicc?
 
-Kimi K2.5 is a powerful model available through AWS Bedrock. Kimicc creates a shim layer that:
+Kimi K2.5 is a powerful model available through [AWS Bedrock](https://aws.amazon.com/bedrock/). See the [Kimi K2.5 model page](https://platform.moonshot.ai/docs/guide/kimi-k2-5-quickstart) and [documentation](https://www.kimi.com/ai-models/kimi-k2-5) for model details and capabilities. Kimicc creates a shim layer that:
 
 1. Starts a LiteLLM proxy to interface with AWS Bedrock
 2. Runs an Anthropic API-compatible shim to translate between Claude Code expectations and Kimi responses
@@ -98,18 +140,26 @@ This lets you use Claude Code's excellent tool use and interface with Kimi K2.5'
 
 ## Installation
 
-### Via pip (recommended)
+### Via pipx (Recommended for most systems)
 
 ```bash
-pip install git+https://github.com/alonb/kimicc
+# Install pipx first
+sudo apt install pipx  # Ubuntu/Debian
+# brew install pipx    # macOS
+
+pipx install git+https://github.com/jswift24/kimicc
 ```
 
-### Manual install
+### Manual install (development)
 
 ```bash
-git clone https://github.com/alonb/kimicc
+git clone https://github.com/jswift24/kimicc
 cd kimicc
-pip install -e .
+pipx install -e .
+# OR use a venv:
+# python -m venv venv
+# source venv/bin/activate
+# pip install -e .
 ```
 
 ## Usage
@@ -142,6 +192,7 @@ kimicc --dangerously-skip-permissions
 Kimi K2.5 requires AWS Bedrock access. Kimicc supports multiple authentication methods:
 
 1. **AWS Profile (recommended)**:
+
    ```bash
    kimicc --aws-profile bedrock-kimi
    # Or via environment:
@@ -150,6 +201,7 @@ Kimi K2.5 requires AWS Bedrock access. Kimicc supports multiple authentication m
    ```
 
 2. **Direct credentials**:
+
    ```bash
    export AWS_ACCESS_KEY_ID=...
    export AWS_SECRET_ACCESS_KEY=...

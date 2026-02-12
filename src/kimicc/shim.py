@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, AsyncIterator, Dict, Optional
+from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, Header, Request, Response
@@ -21,6 +23,16 @@ UPSTREAM_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S", "600"))
 
 # Emulate streaming for tool calls by doing upstream stream=false and re-wrapping into SSE
 EMULATE_STREAM_FOR_TOOLS = os.getenv("SHIM_EMULATE_STREAM_FOR_TOOLS", "1") == "1"
+
+# Model name normalization: rewrite all model names to this value.
+# Claude Code may send secondary requests (for web search, etc.) with different
+# model names like "claude-haiku-4-5-20251001". Since we only have one model
+# configured in LiteLLM, normalize all requests to use it.
+DEFAULT_MODEL = os.getenv("SHIM_DEFAULT_MODEL", "kimi-k2.5")
+
+# Enable shim-side web search execution via DuckDuckGo (when the model calls web_search)
+ENABLE_WEB_SEARCH = os.getenv("SHIM_ENABLE_WEB_SEARCH", "1") == "1"
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("SHIM_WEB_SEARCH_MAX_RESULTS", "5"))
 
 app = FastAPI()
 
@@ -121,6 +133,295 @@ def _normalize_tool_response(msg: Dict[str, Any], request_tools: Optional[list] 
     return result
 
 
+# ---------------------------------------------------------------------------
+# Server-side tool handling
+# ---------------------------------------------------------------------------
+# Anthropic server-side tools (web_search_20250305, etc.) use a different type
+# than regular "custom" tools. LiteLLM/Kimi can't handle these, so we convert
+# them to regular function tools and optionally execute them in the shim.
+
+_WEB_SEARCH_TOOL_SCHEMA = {
+    "name": "web_search",
+    "description": (
+        "Search the web for current information. "
+        "Returns search results with titles, URLs, and descriptions. "
+        "Use this when you need up-to-date information or to verify facts."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+
+def _convert_server_tools(tools: list) -> tuple[list, set[str]]:
+    """
+    Convert Anthropic server-side tools to regular function tools.
+
+    Returns (converted_tools, server_tool_names).
+    Server tool names are tracked so we can intercept their execution later.
+    """
+    converted: list = []
+    server_tool_names: set[str] = set()
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            converted.append(tool)
+            continue
+
+        tool_type = tool.get("type", "")
+
+        # Server-side web search tool (type like "web_search_20250305")
+        if isinstance(tool_type, str) and tool_type.startswith("web_search"):
+            converted.append(_WEB_SEARCH_TOOL_SCHEMA)
+            server_tool_names.add("web_search")
+            logger.info("Converted server-side tool %r → regular function tool", tool_type)
+            continue
+
+        # Other unknown server-side tool types — strip them
+        if tool_type and tool_type != "custom" and not tool.get("input_schema"):
+            logger.info("Stripping unsupported server-side tool: type=%s name=%s", tool_type, tool.get("name"))
+            continue
+
+        converted.append(tool)
+
+    return converted, server_tool_names
+
+
+# ---------------------------------------------------------------------------
+# Web search execution (DuckDuckGo)
+# ---------------------------------------------------------------------------
+
+async def _execute_web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list[dict]:
+    """Execute a web search using DuckDuckGo lite and return results."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=True,
+        ) as client:
+            r = await client.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": query},
+                headers=headers,
+            )
+
+        if r.status_code != 200:
+            logger.warning("DuckDuckGo search failed: status=%s", r.status_code)
+            return []
+
+        return _parse_ddg_lite(r.text, max_results)
+
+    except Exception as e:
+        logger.error("Web search error: %s", e)
+        return []
+
+
+def _parse_ddg_lite(html: str, max_results: int) -> list[dict]:
+    """Parse DuckDuckGo lite HTML for search results."""
+    results: list[dict] = []
+
+    # DuckDuckGo lite puts results as links with class "result-link"
+    link_re = re.compile(
+        r'<a\s+rel="nofollow"\s+href="([^"]+)"\s+class=["\']result-link["\'][^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    snippet_re = re.compile(
+        r'<td\s+class=["\']result-snippet["\'][^>]*>(.*?)</td>',
+        re.DOTALL,
+    )
+
+    links = link_re.findall(html)
+    snippets = snippet_re.findall(html)
+
+    for i, (url, raw_title) in enumerate(links):
+        if i >= max_results:
+            break
+
+        title = re.sub(r"<[^>]+>", "", raw_title).strip()
+        snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
+
+        # DuckDuckGo lite wraps URLs in a redirect — extract the actual URL
+        uddg = re.search(r"[?&]uddg=([^&]+)", url)
+        actual_url = unquote(uddg.group(1)) if uddg else url
+
+        results.append({
+            "type": "web_search_result",
+            "url": actual_url,
+            "title": title,
+            "description": snippet,
+        })
+
+    logger.info("Web search for %r: %d results", html[:60] if not results else results[0].get("title", "?"), len(results))
+    return results
+
+
+async def _execute_server_tool_calls(
+    response_msg: dict,
+    server_tool_names: set[str],
+    original_body: dict,
+    upstream_url: str,
+    headers: dict,
+) -> dict:
+    """
+    If the model's response includes tool calls for server-side tools (web_search),
+    execute them in the shim and feed results back for another model turn.
+
+    Returns the final response message (with search results incorporated).
+    """
+    content = response_msg.get("content")
+    if not isinstance(content, list):
+        return response_msg
+
+    # Find server-side tool calls
+    server_calls = [
+        block for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") in server_tool_names
+    ]
+
+    if not server_calls:
+        return response_msg
+
+    logger.info("Intercepting %d server-side tool call(s)", len(server_calls))
+
+    # Execute each server tool call
+    tool_result_blocks: list[dict] = []
+    server_tool_blocks: list[dict] = []
+    web_search_requests = 0
+    for call in server_calls:
+        name = call.get("name")
+        inp = call.get("input") or {}
+        tid = call.get("id")
+
+        if name == "web_search" and ENABLE_WEB_SEARCH:
+            query = inp.get("query", "")
+            results = await _execute_web_search(query)
+            web_search_requests += 1
+
+            server_tool_blocks.append(
+                {
+                    "type": "server_tool_use",
+                    "id": tid,
+                    "name": "web_search",
+                    "input": {"query": query},
+                }
+            )
+            server_tool_blocks.append(
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": tid,
+                    "content": results,
+                }
+            )
+
+            result_text = "\n\n".join(
+                f"[{r['title']}]({r['url']})\n{r.get('description', '')}"
+                for r in results
+            ) if results else "No results found."
+            tool_result_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tid,
+                "content": result_text,
+            })
+        else:
+            # Unknown server tool — return empty result
+            tool_result_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tid,
+                "content": f"Server-side tool '{name}' is not supported.",
+            })
+
+    # Build follow-up request: original messages + assistant response + tool results
+    follow_up_messages = list(original_body.get("messages", []))
+    follow_up_messages.append({"role": "assistant", "content": content})
+    follow_up_messages.append({"role": "user", "content": tool_result_blocks})
+
+    follow_up_body = dict(original_body)
+    follow_up_body["messages"] = follow_up_messages
+    follow_up_body["stream"] = False
+
+    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(upstream_url, headers=headers, json=follow_up_body)
+
+        if r.status_code >= 400:
+            logger.warning("Server-tool follow-up failed: status=%s", r.status_code)
+            return _attach_server_tool_metadata(response_msg, server_tool_blocks, web_search_requests)
+
+        return _attach_server_tool_metadata(r.json(), server_tool_blocks, web_search_requests)
+    except Exception as e:
+        logger.error("Server-tool follow-up error: %s", e)
+        return _attach_server_tool_metadata(response_msg, server_tool_blocks, web_search_requests)
+
+
+def _attach_server_tool_metadata(
+    msg: dict,
+    server_tool_blocks: list[dict],
+    web_search_requests: int,
+) -> dict:
+    """
+    Add Anthropic server-tool metadata to the final assistant message.
+
+    Claude Code uses these blocks/counters to report web-search activity.
+    """
+    if not isinstance(msg, dict):
+        return msg
+
+    out = dict(msg)
+    content = out.get("content")
+    if not isinstance(content, list):
+        content = []
+
+    if server_tool_blocks:
+        existing_keys = {
+            (
+                b.get("type"),
+                b.get("id") if b.get("type") == "server_tool_use" else b.get("tool_use_id"),
+            )
+            for b in content
+            if isinstance(b, dict)
+        }
+        new_blocks = [
+            b
+            for b in server_tool_blocks
+            if (
+                b.get("type"),
+                b.get("id") if b.get("type") == "server_tool_use" else b.get("tool_use_id"),
+            )
+            not in existing_keys
+        ]
+        out["content"] = new_blocks + content if new_blocks else content
+
+    if web_search_requests > 0:
+        usage = out.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        server_tool_use = usage.get("server_tool_use")
+        if not isinstance(server_tool_use, dict):
+            server_tool_use = {}
+        try:
+            existing_count = int(server_tool_use.get("web_search_requests", 0))
+        except Exception:
+            existing_count = 0
+        server_tool_use["web_search_requests"] = max(existing_count, web_search_requests)
+        usage["server_tool_use"] = server_tool_use
+        out["usage"] = usage
+
+    return out
+
+
 _THINKING_TYPES = {"thinking", "redacted_thinking"}
 
 
@@ -188,7 +489,7 @@ def _normalize_stop_reason(raw: Any, content: list | None = None) -> str:
     # raw is None or falsy — infer from content
     if isinstance(content, list):
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
+            if isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"}:
                 return "tool_use"
     return "end_turn"
 
@@ -284,6 +585,39 @@ def _emulate_anthropic_sse_from_message(msg: Dict[str, Any], request_tools: Opti
                 )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": i})
 
+            elif btype == "server_tool_use":
+                # Anthropic server-tool block emitted directly as a content block.
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": i,
+                        "content_block": {
+                            "type": "server_tool_use",
+                            "id": block.get("id"),
+                            "name": block.get("name"),
+                            "input": block.get("input") or {},
+                        },
+                    },
+                )
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
+            elif btype == "web_search_tool_result":
+                # Anthropic web-search result block.
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": i,
+                        "content_block": {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": block.get("tool_use_id"),
+                            "content": block.get("content") or [],
+                        },
+                    },
+                )
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
             elif btype == "thinking":
                 # Anthropic streaming protocol for thinking blocks:
                 #   content_block_start → {"type": "thinking", "thinking": ""}
@@ -317,7 +651,12 @@ def _emulate_anthropic_sse_from_message(msg: Dict[str, Any], request_tools: Opti
     return gen()
 
 
-async def _proxy_json(url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> Response:
+async def _proxy_json(
+    url: str,
+    headers: Dict[str, str],
+    json_body: Dict[str, Any],
+    server_tool_names: set[str] | None = None,
+) -> Response:
     timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
     request_tools = json_body.get("tools") if isinstance(json_body, dict) else None
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -328,6 +667,11 @@ async def _proxy_json(url: str, headers: Dict[str, str], json_body: Dict[str, An
         if r.status_code < 400 and "application/json" in content_type:
             try:
                 msg = r.json()
+                # Execute server-side tool calls (web_search, etc.) if present
+                if server_tool_names:
+                    msg = await _execute_server_tool_calls(
+                        msg, server_tool_names, json_body, url, headers,
+                    )
                 normalized = _normalize_tool_response(msg, request_tools)
                 normalized = _normalize_thinking_blocks(normalized)
                 # Normalize stop_reason for non-streaming responses too
@@ -364,11 +708,17 @@ async def _proxy_stream_passthrough(url: str, headers: Dict[str, str], json_body
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-async def _proxy_stream_emulated_from_nonstream(url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> StreamingResponse:
+async def _proxy_stream_emulated_from_nonstream(
+    url: str,
+    headers: Dict[str, str],
+    json_body: Dict[str, Any],
+    server_tool_names: set[str] | None = None,
+) -> StreamingResponse:
     """
     Option A:
       - Send upstream request with stream=false
-      - Convert the single JSON response into Anthropic SSE events
+      - Execute any server-side tool calls (web_search, etc.)
+      - Convert the final JSON response into Anthropic SSE events
     """
     timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
     request_tools = json_body.get("tools") if isinstance(json_body, dict) else None
@@ -400,6 +750,12 @@ async def _proxy_stream_emulated_from_nonstream(url: str, headers: Dict[str, str
                 yield _sse("error", {"type": "error", "error": {"raw": r.text}})
                 yield _sse("message_stop", {"type": "message_stop"})
                 return
+
+        # Execute server-side tool calls (web_search, etc.)
+        if server_tool_names:
+            msg = await _execute_server_tool_calls(
+                msg, server_tool_names, json_body, url, headers,
+            )
 
         # Log upstream response metadata
         content_types = [b.get("type") for b in (msg.get("content") or []) if isinstance(b, dict)]
@@ -437,6 +793,24 @@ async def messages(
     anthropic_beta: Optional[str] = Header(default=None),
 ):
     body = _as_dict(await request.json())
+
+    # --- Model name normalization ---
+    # Claude Code may send requests with model names the shim doesn't know
+    # (e.g., "claude-haiku-4-5-20251001" for secondary web search processing).
+    # Normalize to the one model we have configured.
+    requested_model = body.get("model", "")
+    if requested_model != DEFAULT_MODEL:
+        body["model"] = DEFAULT_MODEL
+        if requested_model:
+            logger.info("Model rewritten: %s → %s", requested_model, DEFAULT_MODEL)
+
+    # --- Server-side tool conversion ---
+    # Anthropic server-side tools (type "web_search_20250305", etc.) can't be
+    # forwarded to Kimi via LiteLLM.  Convert them to regular function tools.
+    server_tool_names: set[str] = set()
+    if isinstance(body.get("tools"), list) and body["tools"]:
+        body["tools"], server_tool_names = _convert_server_tools(body["tools"])
+
     stream = bool(body.get("stream", False))
     tools_present = isinstance(body.get("tools"), list) and len(body.get("tools") or []) > 0
 
@@ -444,11 +818,12 @@ async def messages(
     headers = _pick_forward_headers(dict(request.headers))
 
     logger.info(
-        "Incoming %s stream=%s tools=%s model=%s",
+        "Incoming %s stream=%s tools=%s model=%s server_tools=%s",
         str(request.url.path) + (("?" + request.url.query) if request.url.query else ""),
         stream,
         tools_present,
         body.get("model"),
+        server_tool_names or None,
     )
 
     if os.getenv("LOG_BODY", "0") == "1":
@@ -457,11 +832,13 @@ async def messages(
     if stream:
         # Option A: if tools are present, emulate stream using a non-stream upstream call.
         if EMULATE_STREAM_FOR_TOOLS and tools_present:
-            return await _proxy_stream_emulated_from_nonstream(upstream_url, headers=headers, json_body=body)
+            return await _proxy_stream_emulated_from_nonstream(
+                upstream_url, headers=headers, json_body=body, server_tool_names=server_tool_names,
+            )
         # Otherwise, pass-through streaming.
         return await _proxy_stream_passthrough(upstream_url, headers=headers, json_body=body)
 
-    return await _proxy_json(upstream_url, headers=headers, json_body=body)
+    return await _proxy_json(upstream_url, headers=headers, json_body=body, server_tool_names=server_tool_names)
 
 
 @app.post("/v1/messages/count_tokens")
@@ -471,6 +848,14 @@ async def count_tokens(
     anthropic_beta: Optional[str] = Header(default=None),
 ):
     body = _as_dict(await request.json())
+
+    # Normalize model name
+    if body.get("model") and body["model"] != DEFAULT_MODEL:
+        body["model"] = DEFAULT_MODEL
+
+    # Strip server-side tools from count_tokens too
+    if isinstance(body.get("tools"), list) and body["tools"]:
+        body["tools"], _ = _convert_server_tools(body["tools"])
 
     if os.getenv("LOG_TOKENS", "0") == "1":
         logger.info("COUNT_TOKENS REQUEST: %s", json.dumps(body, indent=2)[:20000])
