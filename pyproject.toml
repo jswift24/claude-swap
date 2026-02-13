@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "kimicc"
+name = "cbridge"
 dynamic = ["version"]
 description = "A bridge to use Claude Code CLI with Kimi K2.5 via AWS Bedrock"
 readme = "README.md"
@@ -48,31 +48,31 @@ dev = [
 ]
 
 [project.scripts]
-kimicc = "kimicc.cli:main"
+cbridge = "cbridge.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/jswift24/kimicc"
-Repository = "https://github.com/jswift24/kimicc"
-Issues = "https://github.com/jswift24/kimicc/issues"
+Homepage = "https://github.com/jswift24/cbridge"
+Repository = "https://github.com/jswift24/cbridge"
+Issues = "https://github.com/jswift24/cbridge/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["kimicc"]
-only-include = ["src/kimicc"]
-force-include = { "src/kimicc/data/litellm.yaml" = "kimicc/data/litellm.yaml" }
+packages = ["cbridge"]
+only-include = ["src/cbridge"]
+force-include = { "src/cbridge/data/litellm.yaml" = "cbridge/data/litellm.yaml" }
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/kimicc/**",
+    "src/cbridge/**",
     "README.md",
     "LICENSE",
     "pyproject.toml",
 ]
 
 [tool.hatch.version]
-path = "src/kimicc/__init__.py"
+path = "src/cbridge/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

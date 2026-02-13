@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kimicc import cli
+from cbridge import cli
 
 
 def test_build_parser_uses_explicit_subcommands() -> None:
@@ -42,7 +42,7 @@ def test_load_user_config_creates_default_file(tmp_path: Path, monkeypatch: pyte
     assert config["model"] == "kimi-k2.5"
     assert config["ports"]["litellm"] == 4000
     assert config["ports"]["shim"] == 4001
-    assert (tmp_path / "config" / "kimicc" / "config.yaml").exists()
+    assert (tmp_path / "config" / "cbridge" / "config.yaml").exists()
 
 
 def test_runtime_paths_are_user_scoped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -51,7 +51,7 @@ def test_runtime_paths_are_user_scoped(tmp_path: Path, monkeypatch: pytest.Monke
 
     paths = cli.runtime_paths()
 
-    assert str(paths.base_dir).startswith(str(tmp_path / "data" / "kimicc"))
+    assert str(paths.base_dir).startswith(str(tmp_path / "data" / "cbridge"))
     assert paths.litellm_pid.parent == paths.base_dir
     assert paths.shim_log.parent == paths.base_dir
 
@@ -107,7 +107,7 @@ def test_doctor_accepts_ports_in_use_when_service_is_running(
     paths = cli.runtime_paths()
 
     monkeypatch.setattr(cli, "_check_command", lambda _name: (True, "/bin/fake"))
-    monkeypatch.setattr(cli, "ensure_litellm_config", lambda: tmp_path / "config" / "kimicc" / "litellm.yaml")
+    monkeypatch.setattr(cli, "ensure_litellm_config", lambda: tmp_path / "config" / "cbridge" / "litellm.yaml")
     monkeypatch.setattr(cli, "_aws_signal", lambda _settings: (True, "ok"))
 
     def fake_is_running(pid_file: Path, _host: str, port: int) -> bool:

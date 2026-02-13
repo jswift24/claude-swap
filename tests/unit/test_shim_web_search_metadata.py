@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kimicc import shim
+from cbridge import shim
 
 
 class _DummyResponse:

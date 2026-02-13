@@ -13,20 +13,20 @@ Then it launches Claude Code pointed at that shim.
 ### Recommended (end users)
 
 ```bash
-pipx install git+https://github.com/jswift24/kimicc
+pipx install git+https://github.com/jswift24/cbridge
 ```
 
 When released to PyPI, installation is:
 
 ```bash
-pipx install kimicc
+pipx install cbridge
 ```
 
 ### Development install
 
 ```bash
-git clone https://github.com/jswift24/kimicc
-cd kimicc
+git clone https://github.com/jswift24/cbridge
+cd cbridge
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[test,dev]
@@ -41,38 +41,38 @@ pip install -e .[test,dev]
 export AWS_PROFILE=bedrock-kimi
 
 # Validate environment
-kimicc doctor
+cbridge doctor
 
 # Start services + launch Claude
-kimicc run
+cbridge run
 
 # Pass args to Claude
-kimicc run -- --dangerously-skip-permissions
+cbridge run -- --dangerously-skip-permissions
 ```
 
 ## Commands
 
 ```bash
-kimicc run [-- <claude args...>]   # Start services and launch Claude
-kimicc up                          # Start background services only
-kimicc down                        # Stop background services
-kimicc restart                     # Restart background services only
-kimicc status                      # Show service status
-kimicc logs                        # Show service logs
-kimicc env                         # Print exports for manual Claude launch
-kimicc doctor                      # Run local environment checks
-kimicc health                      # Check live runtime health
-kimicc config path|show|init|edit  # Discover/manage config files
+cbridge run [-- <claude args...>]   # Start services and launch Claude
+cbridge up                          # Start background services only
+cbridge down                        # Stop background services
+cbridge restart                     # Restart background services only
+cbridge status                      # Show service status
+cbridge logs                        # Show service logs
+cbridge env                         # Print exports for manual Claude launch
+cbridge doctor                      # Run local environment checks
+cbridge health                      # Check live runtime health
+cbridge config path|show|init|edit  # Discover/manage config files
 ```
 
-`kimicc restart` does not launch Claude.
+`cbridge restart` does not launch Claude.
 
 ## Configuration
 
 Kimicc auto-creates user config on first run:
 
-- `~/.config/kimicc/config.yaml`
-- `~/.config/kimicc/litellm.yaml`
+- `~/.config/cbridge/config.yaml`
+- `~/.config/cbridge/litellm.yaml`
 
 Default `config.yaml`:
 
@@ -90,10 +90,10 @@ logs:
 
 Runtime files are user-scoped (not global `/tmp`):
 
-- `~/.local/share/kimicc/litellm.pid`
-- `~/.local/share/kimicc/shim.pid`
-- `~/.local/share/kimicc/litellm.log`
-- `~/.local/share/kimicc/shim.log`
+- `~/.local/share/cbridge/litellm.pid`
+- `~/.local/share/cbridge/shim.pid`
+- `~/.local/share/cbridge/litellm.log`
+- `~/.local/share/cbridge/shim.log`
 
 ## AWS Authentication
 
@@ -113,13 +113,13 @@ export AWS_SECRET_ACCESS_KEY=...
 If startup fails, run:
 
 ```bash
-kimicc doctor
+cbridge doctor
 ```
 
 For runtime connectivity checks once services are up:
 
 ```bash
-kimicc health
+cbridge health
 ```
 
 ## Architecture
@@ -137,8 +137,8 @@ The shim normalizes compatibility details Claude Code expects, including:
 
 ## Troubleshooting
 
-1. Run `kimicc doctor` and fix any `FAIL` lines.
-2. Check logs with `kimicc logs`.
+1. Run `cbridge doctor` and fix any `FAIL` lines.
+2. Check logs with `cbridge logs`.
 3. Confirm your AWS credentials can access Bedrock in your target region.
 4. Ensure ports `4000` and `4001` are free or override them in config.
 

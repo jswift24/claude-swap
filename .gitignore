@@ -60,7 +60,7 @@ cover/
 Thumbs.db
 
 # Kimicc specific
-/tmp/kimicc/
+/tmp/cbridge/
 /tmp/claude-kimi-*.pid
 /tmp/claude-kimi-*.log
 
