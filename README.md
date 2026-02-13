@@ -1,6 +1,6 @@
 # Kimicc
 
-A bridge that lets you use Claude Code CLI with [Kimi K2.5](https://www.kimi.com/ai-models/kimi-k2-5) on [AWS Bedrock](https://aws.amazon.com/bedrock/) as the AI backend.
+Run Claude Code CLI with a 90% discount by using [Kimi K2.5](https://www.kimi.com/ai-models/kimi-k2-5) on [AWS Bedrock](https://aws.amazon.com/bedrock/) as the AI backend.
 
 ## Quick Start
 
@@ -42,9 +42,9 @@ pipx install -e .
 kimicc --help
 ```
 
-### Alternative: Use Existing Virtual Environment
+### Alternative: Use Virtual Environment
 
-If you have an existing venv (e.g., from cc-kimi):
+If you have an existing venv:
 
 ```bash
 source /path/to/.venv/bin/activate
@@ -60,7 +60,7 @@ Kimi K2.5 requires AWS Bedrock access. Choose one method:
 
 **Option A: AWS Profile (recommended)**
 
-An AWS profile stores your credentials in `~/.aws/credentials` and `~/.aws/config`. To create one:
+If you've already installed the AWS CLI, you can store your AWS credentials in `~/.aws/credentials` and `~/.aws/config` as follows:
 
 ```bash
 # Configure a new profile named "bedrock-kimi"
@@ -224,6 +224,32 @@ Kimi K2.5 requires AWS Bedrock access. Kimicc supports multiple authentication m
                     Translates Anthropic
                     API ↔ Kimi/OpenAI format
 ```
+
+### Why Kimicc Exists
+
+Claude Code is an excellent code harness, but Anthropic's models are very expensive. You can *in theory* configure Claude Code to work with any model, but in practice there are lots of problems because CC is built around Anthropic's Messages API contract, which third party models don't support out of the box. This leads to a bunch of gaps, listed below. LiteLLM claims to bridge the gap, but doesn't really.
+
+Kimicc exists to make that combination reliable in real Claude Code workflows (tool use, streaming, and multi-turn sessions), not just basic single-turn completions.
+
+Hopefully, Kimicc will inspire LiteLLM, Moonshot and/or Amazon to support this scenario, so that Kimicc is no longer needed.
+
+### How Kimicc Makes It Work
+
+LiteLLM handles most of the protocol translation, and the shim handles behavior-level compatibility so Claude Code can keep operating normally.
+
+In practice, the shim normalizes and bridges key incompatibilities:
+
+| Problem | Why it breaks Claude Code | What kimicc does |
+|---------|---------------------------|------------------|
+| Tool name casing differences | Claude tool binding is case-sensitive (`Bash` vs `bash`) | Restores tool names to the original casing from the request |
+| Tool ID formatting quirks | Whitespace/malformed IDs can break tool result matching | Normalizes tool IDs before returning to Claude Code |
+| Anthropic streaming semantics | Claude expects Anthropic SSE events (`input_json_delta`, etc.) | Emulates Anthropic SSE from non-stream upstream responses when needed |
+| Reasoning block format (`thinking`) | Kimi-style thinking blocks may not match Anthropic block shape | Normalizes thinking blocks for Claude-compatible rendering |
+| Stop reason mismatch | OpenAI-style stop reasons differ from Anthropic (`stop` vs `end_turn`) | Maps/infers stop reasons to Anthropic-compatible values |
+| Model name drift in sub-requests | Claude can send alternate model IDs in internal requests | Rewrites requests to configured `kimi-k2.5` model |
+| Server-side web search tool type | Anthropic server tool types are not directly supported upstream | Converts and executes web search in the shim, then returns Anthropic-style search metadata |
+
+This design keeps the developer experience close to native Claude Code, while swapping the backend model to Kimi K2.5.
 
 ## License
 
