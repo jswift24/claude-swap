@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-logger = logging.getLogger("cbridge-shim")
+logger = logging.getLogger("claude-swap-shim")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 APP_HOST = os.getenv("SHIM_HOST", "127.0.0.1")
@@ -777,7 +777,7 @@ async def root() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "service": "cbridge-shim",
+            "service": "claude-swap-shim",
             "upstream": UPSTREAM_BASE,
             "stream_emulation": {
                 "enabled_for_tools": EMULATE_STREAM_FOR_TOOLS,
@@ -876,7 +876,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "cbridge.shim:app",
+        "claude_swap.shim:app",
         host=APP_HOST,
         port=APP_PORT,
         reload=False,

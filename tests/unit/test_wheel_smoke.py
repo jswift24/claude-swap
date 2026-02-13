@@ -26,9 +26,9 @@ def test_built_wheel_contains_runtime_assets(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheel_files[0]) as archive:
         names = set(archive.namelist())
 
-    assert "cbridge/cli.py" in names
-    assert "cbridge/shim.py" in names
-    assert "cbridge/data/litellm.yaml" in names
+    assert "claude_swap/cli.py" in names
+    assert "claude_swap/shim.py" in names
+    assert "claude_swap/data/litellm.yaml" in names
     assert any(name.endswith("dist-info/licenses/LICENSE") for name in names)
 
 
@@ -50,5 +50,5 @@ def test_python_build_wheel_from_sdist_contains_package_code(tmp_path: Path) -> 
     with zipfile.ZipFile(wheel_files[0]) as archive:
         names = set(archive.namelist())
 
-    assert "cbridge/cli.py" in names
-    assert "cbridge/shim.py" in names
+    assert "claude_swap/cli.py" in names
+    assert "claude_swap/shim.py" in names

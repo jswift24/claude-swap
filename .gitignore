@@ -59,8 +59,8 @@ cover/
 .DS_Store
 Thumbs.db
 
-# cbridge specific
-/tmp/cbridge/
+# claude-swap specific
+/tmp/claude-swap/
 /tmp/claude-kimi-*.pid
 /tmp/claude-kimi-*.log
 

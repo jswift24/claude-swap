@@ -1,8 +1,8 @@
-# cbridge
+# claude-swap
 
 Use Claude Code with Kimi K2.5 on AWS Bedrock through a local compatibility shim.
 
-cbridge runs two local services:
+claude-swap runs two local services:
 1. LiteLLM proxy (Bedrock backend)
 2. Anthropic-compatible shim for Claude Code
 
@@ -13,20 +13,20 @@ Then it launches Claude Code pointed at that shim.
 ### Recommended (end users)
 
 ```bash
-pipx install git+https://github.com/jswift24/cbridge
+pipx install git+https://github.com/jswift24/claude-swap
 ```
 
 When released to PyPI, installation is:
 
 ```bash
-pipx install cbridge
+pipx install claude-swap
 ```
 
 ### Development install
 
 ```bash
-git clone https://github.com/jswift24/cbridge
-cd cbridge
+git clone https://github.com/jswift24/claude-swap
+cd claude-swap
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[test,dev]
@@ -41,38 +41,38 @@ pip install -e .[test,dev]
 export AWS_PROFILE=bedrock-kimi
 
 # Validate environment
-cbridge doctor
+claude-swap doctor
 
 # Start services + launch Claude
-cbridge run
+claude-swap run
 
 # Pass args to Claude
-cbridge run -- --dangerously-skip-permissions
+claude-swap run -- --dangerously-skip-permissions
 ```
 
 ## Commands
 
 ```bash
-cbridge run [-- <claude args...>]   # Start services and launch Claude
-cbridge up                          # Start background services only
-cbridge down                        # Stop background services
-cbridge restart                     # Restart background services only
-cbridge status                      # Show service status
-cbridge logs                        # Show service logs
-cbridge env                         # Print exports for manual Claude launch
-cbridge doctor                      # Run local environment checks
-cbridge health                      # Check live runtime health
-cbridge config path|show|init|edit  # Discover/manage config files
+claude-swap run [-- <claude args...>]   # Start services and launch Claude
+claude-swap up                          # Start background services only
+claude-swap down                        # Stop background services
+claude-swap restart                     # Restart background services only
+claude-swap status                      # Show service status
+claude-swap logs                        # Show service logs
+claude-swap env                         # Print exports for manual Claude launch
+claude-swap doctor                      # Run local environment checks
+claude-swap health                      # Check live runtime health
+claude-swap config path|show|init|edit  # Discover/manage config files
 ```
 
-`cbridge restart` does not launch Claude.
+`claude-swap restart` does not launch Claude.
 
 ## Configuration
 
-cbridge auto-creates user config on first run:
+claude-swap auto-creates user config on first run:
 
-- `~/.config/cbridge/config.yaml`
-- `~/.config/cbridge/litellm.yaml`
+- `~/.config/claude-swap/config.yaml`
+- `~/.config/claude-swap/litellm.yaml`
 
 Default `config.yaml`:
 
@@ -90,14 +90,14 @@ logs:
 
 Runtime files are user-scoped (not global `/tmp`):
 
-- `~/.local/share/cbridge/litellm.pid`
-- `~/.local/share/cbridge/shim.pid`
-- `~/.local/share/cbridge/litellm.log`
-- `~/.local/share/cbridge/shim.log`
+- `~/.local/share/claude-swap/litellm.pid`
+- `~/.local/share/claude-swap/shim.pid`
+- `~/.local/share/claude-swap/litellm.log`
+- `~/.local/share/claude-swap/shim.log`
 
 ## AWS Authentication
 
-cbridge relies on the standard AWS credential chain used by LiteLLM/Bedrock.
+claude-swap relies on the standard AWS credential chain used by LiteLLM/Bedrock.
 
 Common options:
 
@@ -113,19 +113,19 @@ export AWS_SECRET_ACCESS_KEY=...
 If startup fails, run:
 
 ```bash
-cbridge doctor
+claude-swap doctor
 ```
 
 For runtime connectivity checks once services are up:
 
 ```bash
-cbridge health
+claude-swap health
 ```
 
 ## Architecture
 
 ```text
-Claude Code -> cbridge Shim (4001) -> LiteLLM (4000) -> AWS Bedrock (Kimi K2.5)
+Claude Code -> claude-swap Shim (4001) -> LiteLLM (4000) -> AWS Bedrock (Kimi K2.5)
 ```
 
 The shim normalizes compatibility details Claude Code expects, including:
@@ -137,8 +137,8 @@ The shim normalizes compatibility details Claude Code expects, including:
 
 ## Troubleshooting
 
-1. Run `cbridge doctor` and fix any `FAIL` lines.
-2. Check logs with `cbridge logs`.
+1. Run `claude-swap doctor` and fix any `FAIL` lines.
+2. Check logs with `claude-swap logs`.
 3. Confirm your AWS credentials can access Bedrock in your target region.
 4. Ensure ports `4000` and `4001` are free or override them in config.
 

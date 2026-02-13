@@ -29,9 +29,9 @@ def test_version_is_single_sourced_from_package() -> None:
     assert "version" not in project
     assert "dynamic" in project
     assert "version" in project["dynamic"]
-    assert data["tool"]["hatch"]["version"]["path"] == "src/cbridge/__init__.py"
+    assert data["tool"]["hatch"]["version"]["path"] == "src/claude_swap/__init__.py"
 
 
 def test_packaged_runtime_assets_exist() -> None:
-    assert (REPO_ROOT / "src" / "cbridge" / "data" / "litellm.yaml").exists()
+    assert (REPO_ROOT / "src" / "claude_swap" / "data" / "litellm.yaml").exists()
     assert (REPO_ROOT / "LICENSE").exists()

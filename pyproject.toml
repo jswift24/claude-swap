@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cbridge"
+name = "claude-swap"
 dynamic = ["version"]
 description = "A bridge to use Claude Code CLI with Kimi K2.5 via AWS Bedrock"
 readme = "README.md"
@@ -48,31 +48,31 @@ dev = [
 ]
 
 [project.scripts]
-cbridge = "cbridge.cli:main"
+claude-swap = "claude_swap.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/jswift24/cbridge"
-Repository = "https://github.com/jswift24/cbridge"
-Issues = "https://github.com/jswift24/cbridge/issues"
+Homepage = "https://github.com/jswift24/claude-swap"
+Repository = "https://github.com/jswift24/claude-swap"
+Issues = "https://github.com/jswift24/claude-swap/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["cbridge"]
-only-include = ["src/cbridge"]
-force-include = { "src/cbridge/data/litellm.yaml" = "cbridge/data/litellm.yaml" }
+packages = ["claude_swap"]
+only-include = ["src/claude_swap"]
+force-include = { "src/claude_swap/data/litellm.yaml" = "claude_swap/data/litellm.yaml" }
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/cbridge/**",
+    "src/claude_swap/**",
     "README.md",
     "LICENSE",
     "pyproject.toml",
 ]
 
 [tool.hatch.version]
-path = "src/cbridge/__init__.py"
+path = "src/claude_swap/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

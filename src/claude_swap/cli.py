@@ -1,4 +1,4 @@
-"""CLI entry point for cbridge."""
+"""CLI entry point for claude-swap."""
 from __future__ import annotations
 
 import argparse
@@ -62,7 +62,7 @@ def _default_config() -> dict[str, Any]:
 
 
 def _config_dir() -> Path:
-    return Path(user_config_path("cbridge", appauthor=False))
+    return Path(user_config_path("claude-swap", appauthor=False))
 
 
 def _config_file() -> Path:
@@ -105,7 +105,7 @@ def load_user_config() -> dict[str, Any]:
 
 def runtime_paths() -> RuntimePaths:
     """Return user-scoped runtime file paths."""
-    base_dir = Path(user_data_path("cbridge", appauthor=False))
+    base_dir = Path(user_data_path("claude-swap", appauthor=False))
     base_dir.mkdir(parents=True, exist_ok=True)
     return RuntimePaths(
         base_dir=base_dir,
@@ -117,7 +117,7 @@ def runtime_paths() -> RuntimePaths:
 
 
 def _packaged_litellm_template() -> str:
-    return resources.files("cbridge.data").joinpath("litellm.yaml").read_text(encoding="utf-8")
+    return resources.files("claude_swap.data").joinpath("litellm.yaml").read_text(encoding="utf-8")
 
 
 def ensure_litellm_config() -> Path:
@@ -256,7 +256,7 @@ def launch_claude(settings: Settings, claude_args: Iterable[str]) -> None:
     _apply_env_exports(settings)
     args = list(claude_args)
 
-    print("\nServices ready. Launching Claude with cbridge backend...")
+    print("\nServices ready. Launching Claude with claude-swap backend...")
     if args:
         print(f"  Claude arguments: {' '.join(args)}")
 
@@ -324,7 +324,7 @@ def start_shim(settings: Settings, paths: RuntimePaths) -> None:
             sys.executable,
             "-m",
             "uvicorn",
-            "cbridge.shim:app",
+            "claude_swap.shim:app",
             "--host",
             settings.host,
             "--port",
@@ -474,11 +474,11 @@ def run_doctor(settings: Settings, paths: RuntimePaths | None = None) -> bool:
     if not all_good:
         print("\nSuggested fixes:")
         if not litellm_ok:
-            print("- Install cbridge in a venv or pipx so `litellm` is on PATH.")
+            print("- Install claude-swap in a venv or pipx so `litellm` is on PATH.")
         if not claude_ok:
             print("- Install Claude Code CLI and confirm `claude` is on PATH.")
         if not port1_ok or not port2_ok:
-            print("- Run `cbridge status` and `cbridge down`, or change configured ports.")
+            print("- Run `claude-swap status` and `claude-swap down`, or change configured ports.")
         if not aws_ok:
             print("- Set `AWS_PROFILE` or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`.")
 
@@ -536,7 +536,7 @@ def config_command(command: str) -> int:
         load_user_config()
         editor = os.getenv("EDITOR") or os.getenv("VISUAL")
         if not editor:
-            print("ERROR: set EDITOR or VISUAL to use `cbridge config edit`", file=sys.stderr)
+            print("ERROR: set EDITOR or VISUAL to use `claude-swap config edit`", file=sys.stderr)
             return 1
         cmd = [*shlex.split(editor), str(config_path)]
         try:
@@ -603,7 +603,7 @@ def _add_aws_flag(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser with explicit subcommands."""
     parser = argparse.ArgumentParser(
-        prog="cbridge",
+        prog="claude-swap",
         description="Run Claude Code with a local Kimi-compatible shim backend",
     )
 
@@ -637,14 +637,14 @@ def build_parser() -> argparse.ArgumentParser:
     env_cmd.add_argument("--model", default=None, help="Model override")
     env_cmd.add_argument("--shim-port", type=int, default=None, help="Shim port override")
 
-    doctor_cmd = subparsers.add_parser("doctor", help="Check local cbridge readiness")
+    doctor_cmd = subparsers.add_parser("doctor", help="Check local claude-swap readiness")
     _add_network_flags(doctor_cmd)
     _add_aws_flag(doctor_cmd)
 
     health_cmd = subparsers.add_parser("health", help="Check runtime health of running services")
     _add_network_flags(health_cmd)
 
-    config_cmd = subparsers.add_parser("config", help="Manage cbridge configuration")
+    config_cmd = subparsers.add_parser("config", help="Manage claude-swap configuration")
     config_subparsers = config_cmd.add_subparsers(dest="config_command")
     config_subparsers.add_parser("path", help="Print config file path")
     config_subparsers.add_parser("show", help="Print merged config")
@@ -703,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                     if run_health(settings, paths):
                         break
                     time.sleep(0.5)
-            print("\nServices are running. Use `cbridge run` to launch Claude.")
+            print("\nServices are running. Use `claude-swap run` to launch Claude.")
             return 0
 
         if args.command == "restart":
