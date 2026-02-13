@@ -562,7 +562,7 @@ def _emulate_anthropic_sse_from_message(msg: Dict[str, Any], request_tools: Opti
                 #   content_block_delta → input_json_delta with actual JSON
                 #   content_block_stop
                 # Claude Code reads input ONLY from deltas, not from start.
-                tool_block = {
+                tool_block: dict[str, Any] = {
                     "type": "tool_use",
                     "id": block.get("id"),
                     "name": block.get("name"),

@@ -3,457 +3,734 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
+from collections import deque
+from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
-from typing import List
+from typing import Any, Iterable
 
-# Default configuration
-DEFAULT_LITELLM_PORT = 4000
-DEFAULT_SHIM_PORT = 4001
+import httpx
+import yaml
+from platformdirs import user_config_path, user_data_path
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MODEL = "kimi-k2.5"
-
-# PID files
-PIDFILE_LITELLM = Path("/tmp/kimicc-litellm.pid")
-PIDFILE_SHIM = Path("/tmp/kimicc-shim.pid")
-LOGFILE_LITELLM = Path("/tmp/kimicc-litellm.log")
-LOGFILE_SHIM = Path("/tmp/kimicc-shim.log")
+DEFAULT_LITELLM_PORT = 4000
+DEFAULT_SHIM_PORT = 4001
+DEFAULT_LOG_LINES = 50
 
 
-def get_kimicc_home() -> Path:
-    """Get the kimicc installation directory."""
-    if "KIMICC_HOME" in os.environ:
-        return Path(os.environ["KIMICC_HOME"])
+@dataclass(frozen=True)
+class RuntimePaths:
+    base_dir: Path
+    litellm_pid: Path
+    shim_pid: Path
+    litellm_log: Path
+    shim_log: Path
 
-    # Try to find from package location by walking up until we find config/litellm.yaml
+
+@dataclass(frozen=True)
+class Settings:
+    host: str
+    model: str
+    litellm_port: int
+    shim_port: int
+    aws_profile: str | None
+    default_claude_args: list[str]
+    log_lines: int
+
+
+def _default_config() -> dict[str, Any]:
+    return {
+        "host": DEFAULT_HOST,
+        "model": DEFAULT_MODEL,
+        "aws_profile": None,
+        "ports": {
+            "litellm": DEFAULT_LITELLM_PORT,
+            "shim": DEFAULT_SHIM_PORT,
+        },
+        "claude_args": [],
+        "logs": {"lines": DEFAULT_LOG_LINES},
+    }
+
+
+def _config_dir() -> Path:
+    return Path(user_config_path("kimicc", appauthor=False))
+
+
+def _config_file() -> Path:
+    return _config_dir() / "config.yaml"
+
+
+def _merge_dict(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_user_config() -> dict[str, Any]:
+    """Load user config and create defaults on first run."""
+    config_path = _config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    defaults = _default_config()
+
+    if not config_path.exists():
+        config_path.write_text(yaml.safe_dump(defaults, sort_keys=False), encoding="utf-8")
+        return defaults
+
+    raw = config_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        config_path.write_text(yaml.safe_dump(defaults, sort_keys=False), encoding="utf-8")
+        return defaults
+
+    parsed = yaml.safe_load(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Invalid config file format: {config_path}")
+
+    merged = _merge_dict(defaults, parsed)
+    return merged
+
+
+def runtime_paths() -> RuntimePaths:
+    """Return user-scoped runtime file paths."""
+    base_dir = Path(user_data_path("kimicc", appauthor=False))
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return RuntimePaths(
+        base_dir=base_dir,
+        litellm_pid=base_dir / "litellm.pid",
+        shim_pid=base_dir / "shim.pid",
+        litellm_log=base_dir / "litellm.log",
+        shim_log=base_dir / "shim.log",
+    )
+
+
+def _packaged_litellm_template() -> str:
+    return resources.files("kimicc.data").joinpath("litellm.yaml").read_text(encoding="utf-8")
+
+
+def ensure_litellm_config() -> Path:
+    """Ensure user-local litellm config exists and return its path."""
+    litellm_config = _config_dir() / "litellm.yaml"
+    litellm_config.parent.mkdir(parents=True, exist_ok=True)
+
+    if not litellm_config.exists():
+        litellm_config.write_text(_packaged_litellm_template(), encoding="utf-8")
+
+    return litellm_config
+
+
+def _port_listening(host: str, port: int, timeout_s: float = 1.0) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout_s)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _is_running(pid_file: Path, host: str, port: int) -> bool:
+    if not pid_file.exists():
+        return False
+
     try:
-        import kimicc
-        candidate = Path(kimicc.__file__).parent  # src/kimicc/
-        for _ in range(4):
-            candidate = candidate.parent
-            if (candidate / "config" / "litellm.yaml").exists():
-                return candidate
-    except Exception:
-        pass
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError, ValueError):
+        return False
 
-    # Fallback to script location
-    script_dir = Path(__file__).parent  # src/kimicc/
-    for _ in range(4):
-        script_dir = script_dir.parent
-        if (script_dir / "config" / "litellm.yaml").exists():
-            return script_dir
-
-    raise RuntimeError("Cannot find kimicc installation. Set KIMICC_HOME environment variable.")
+    return _port_listening(host, port, timeout_s=1.5)
 
 
-def is_running(pidfile: Path, port: int) -> bool:
-    """Check if a service is running by PID and port test."""
-    if pidfile.exists():
-        try:
-            pid = int(pidfile.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
-            # Also verify the port is listening
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2)
-                if s.connect_ex((DEFAULT_HOST, port)) == 0:
-                    return True
-        except (OSError, ProcessLookupError, ValueError):
-            pass
+def _wait_for_ready(pid_file: Path, host: str, port: int, timeout_s: float, proc: subprocess.Popen[Any]) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _is_running(pid_file, host, port):
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.5)
     return False
 
 
-def start_litellm(kimicc_home: Path, host: str, port: int, aws_profile: str | None = None) -> None:
-    """Start the LiteLLM proxy service."""
-    if is_running(PIDFILE_LITELLM, port):
-        pid = int(PIDFILE_LITELLM.read_text().strip())
+def _tail_file(path: Path, lines: int) -> str:
+    if not path.exists():
+        return "(no log)"
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        buf = deque(handle, maxlen=lines)
+    return "".join(buf).rstrip() or "(empty log)"
+
+
+def _check_command(name: str) -> tuple[bool, str]:
+    found = shutil.which(name)
+    if found:
+        return True, found
+    return False, "not found in PATH"
+
+
+def _port_available(host: str, port: int) -> tuple[bool, str]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            return False, str(exc)
+    return True, "available"
+
+
+def _http_ok(url: str, timeout_s: float = 2.0) -> tuple[bool, str]:
+    try:
+        response = httpx.get(url, timeout=timeout_s)
+    except httpx.HTTPError as exc:
+        return False, str(exc)
+
+    if response.status_code >= 400:
+        return False, f"HTTP {response.status_code}"
+    return True, f"HTTP {response.status_code}"
+
+
+def _aws_signal(settings: Settings) -> tuple[bool, str]:
+    if settings.aws_profile:
+        return True, f"using profile '{settings.aws_profile}'"
+
+    env_profile = os.getenv("AWS_PROFILE")
+    if env_profile:
+        return True, f"AWS_PROFILE={env_profile}"
+
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+    if access_key and secret:
+        return True, "using AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+
+    return False, "no AWS profile or keypair detected"
+
+
+def _doctor_port_check(
+    pid_file: Path, service_name: str, host: str, port: int
+) -> tuple[bool, str]:
+    if _is_running(pid_file, host, port):
+        return True, f"in use by running {service_name}"
+    return _port_available(host, port)
+
+
+def emit_env(settings: Settings) -> str:
+    """Emit environment variables for Claude."""
+    return (
+        f'export ANTHROPIC_BASE_URL="http://{settings.host}:{settings.shim_port}"\n'
+        f'export ANTHROPIC_MODEL="{settings.model}"\n'
+        'export ANTHROPIC_API_KEY="sk-litellm-local"\n'
+        "unset CLAUDE_CODE_USE_BEDROCK\n"
+        "unset CLAUDE_CODE_USE_VERTEX\n"
+        "unset CLAUDE_CODE_USE_FOUNDRY\n"
+        "export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1\n"
+        "export CLAUDE_CODE_SKIP_VERTEX_AUTH=1\n"
+        "export CLAUDE_CODE_SKIP_FOUNDRY_AUTH=1\n"
+        "export CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING=1\n"
+    )
+
+
+def _apply_env_exports(settings: Settings) -> None:
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://{settings.host}:{settings.shim_port}"
+    os.environ["ANTHROPIC_MODEL"] = settings.model
+    os.environ["ANTHROPIC_API_KEY"] = "sk-litellm-local"
+    os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
+    os.environ.pop("CLAUDE_CODE_USE_VERTEX", None)
+    os.environ.pop("CLAUDE_CODE_USE_FOUNDRY", None)
+    os.environ["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] = "1"
+    os.environ["CLAUDE_CODE_SKIP_VERTEX_AUTH"] = "1"
+    os.environ["CLAUDE_CODE_SKIP_FOUNDRY_AUTH"] = "1"
+    os.environ["CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
+
+
+def launch_claude(settings: Settings, claude_args: Iterable[str]) -> None:
+    """Launch Claude with the configured environment."""
+    _apply_env_exports(settings)
+    args = list(claude_args)
+
+    print("\nServices ready. Launching Claude with kimicc backend...")
+    if args:
+        print(f"  Claude arguments: {' '.join(args)}")
+
+    os.execvp("claude", ["claude", *args])
+
+
+def start_litellm(settings: Settings, paths: RuntimePaths) -> None:
+    """Start LiteLLM if needed."""
+    if _is_running(paths.litellm_pid, settings.host, settings.litellm_port):
+        pid = int(paths.litellm_pid.read_text(encoding="utf-8").strip())
         print(f"LiteLLM already running (pid {pid})")
         return
 
-    print(f"Starting LiteLLM on port {port}...")
+    litellm_bin = shutil.which("litellm")
+    if not litellm_bin:
+        raise RuntimeError("litellm executable not found in PATH")
 
-    config_path = kimicc_home / "config" / "litellm.yaml"
-
+    config_path = ensure_litellm_config()
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    if aws_profile:
-        env["AWS_PROFILE"] = aws_profile
+    if settings.aws_profile:
+        env["AWS_PROFILE"] = settings.aws_profile
 
-    # Check if litellm is available
-    try:
-        subprocess.run(["litellm", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("ERROR: litellm not found. Install it with: pip install litellm")
-        sys.exit(1)
-
-    # Start LiteLLM process
-    log = open(LOGFILE_LITELLM, "a")
+    log_handle = paths.litellm_log.open("a", encoding="utf-8")
     proc = subprocess.Popen(
         [
-            "litellm",
-            "--config", str(config_path),
-            "--host", host,
-            "--port", str(port),
+            litellm_bin,
+            "--config",
+            str(config_path),
+            "--host",
+            settings.host,
+            "--port",
+            str(settings.litellm_port),
         ],
-        stdout=log,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
         env=env,
     )
 
-    PIDFILE_LITELLM.write_text(str(proc.pid))
+    paths.litellm_pid.write_text(str(proc.pid), encoding="utf-8")
 
-    # Wait for it to be ready
-    for i in range(30):
-        time.sleep(1)
-        if is_running(PIDFILE_LITELLM, port):
-            print(f"LiteLLM ready (pid {proc.pid})")
-            return
-        if proc.poll() is not None:
-            print(f"ERROR: LiteLLM failed to start. Check {LOGFILE_LITELLM}")
-            sys.exit(1)
+    if not _wait_for_ready(paths.litellm_pid, settings.host, settings.litellm_port, 30.0, proc):
+        raise RuntimeError(f"LiteLLM failed to start. Check {paths.litellm_log}")
 
-    print(f"ERROR: LiteLLM failed to start in time. Check {LOGFILE_LITELLM}")
-    sys.exit(1)
+    print(f"LiteLLM ready (pid {proc.pid})")
 
 
-def start_shim(kimicc_home: Path, host: str, port: int, litellm_port: int) -> None:
-    """Start the shim service."""
-    if is_running(PIDFILE_SHIM, port):
-        pid = int(PIDFILE_SHIM.read_text().strip())
+def start_shim(settings: Settings, paths: RuntimePaths) -> None:
+    """Start shim if needed."""
+    if _is_running(paths.shim_pid, settings.host, settings.shim_port):
+        pid = int(paths.shim_pid.read_text(encoding="utf-8").strip())
         print(f"Shim already running (pid {pid})")
         return
 
-    print(f"Starting shim on port {port}...")
-
     env = os.environ.copy()
-    env["LITELLM_BASE_URL"] = f"http://{host}:{litellm_port}"
-    env["SHIM_HOST"] = host
-    env["SHIM_PORT"] = str(port)
+    env["LITELLM_BASE_URL"] = f"http://{settings.host}:{settings.litellm_port}"
+    env["SHIM_HOST"] = settings.host
+    env["SHIM_PORT"] = str(settings.shim_port)
+    env["SHIM_DEFAULT_MODEL"] = settings.model
     env["PYTHONUNBUFFERED"] = "1"
 
-    log = open(LOGFILE_SHIM, "a")
+    log_handle = paths.shim_log.open("a", encoding="utf-8")
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "uvicorn",
+            sys.executable,
+            "-m",
+            "uvicorn",
             "kimicc.shim:app",
-            "--host", host,
-            "--port", str(port),
-            "--log-level", "warning",
+            "--host",
+            settings.host,
+            "--port",
+            str(settings.shim_port),
+            "--log-level",
+            "warning",
         ],
-        stdout=log,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
         env=env,
     )
 
-    PIDFILE_SHIM.write_text(str(proc.pid))
+    paths.shim_pid.write_text(str(proc.pid), encoding="utf-8")
 
-    # Wait for it to be ready
-    for i in range(15):
-        time.sleep(1)
-        if is_running(PIDFILE_SHIM, port):
-            print(f"Shim ready (pid {proc.pid})")
+    if not _wait_for_ready(paths.shim_pid, settings.host, settings.shim_port, 20.0, proc):
+        raise RuntimeError(f"Shim failed to start. Check {paths.shim_log}")
+
+    print(f"Shim ready (pid {proc.pid})")
+
+
+def start_services(settings: Settings, paths: RuntimePaths | None = None) -> None:
+    """Start all background services."""
+    paths = paths or runtime_paths()
+    start_litellm(settings, paths)
+    start_shim(settings, paths)
+
+
+def _stop_pid(pid_file: Path, name: str) -> None:
+    if not pid_file.exists():
+        return
+
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except ValueError:
+        pid_file.unlink(missing_ok=True)
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        return
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f"Stopped {name} (pid {pid})")
+            pid_file.unlink(missing_ok=True)
             return
-        if proc.poll() is not None:
-            print(f"ERROR: Shim failed to start. Check {LOGFILE_SHIM}")
-            sys.exit(1)
+        time.sleep(0.1)
 
-    print(f"ERROR: Shim failed to start in time. Check {LOGFILE_SHIM}")
-    sys.exit(1)
-
-
-def stop_services() -> None:
-    """Stop all running services."""
-    for pidfile in [PIDFILE_SHIM, PIDFILE_LITELLM]:
-        if pidfile.exists():
-            try:
-                pid = int(pidfile.read_text().strip())
-                os.kill(pid, 15)  # SIGTERM
-                print(f"Stopped pid {pid}")
-            except (OSError, ProcessLookupError, ValueError):
-                pass
-            pidfile.unlink(missing_ok=True)
-    print("Services stopped.")
+    try:
+        os.kill(pid, signal.SIGKILL)
+        print(f"Force-stopped {name} (pid {pid})")
+    except ProcessLookupError:
+        print(f"Stopped {name} (pid {pid})")
+    finally:
+        pid_file.unlink(missing_ok=True)
 
 
-def show_status() -> None:
-    """Show service status."""
-    litellm_status = "running" if is_running(PIDFILE_LITELLM, DEFAULT_LITELLM_PORT) else "stopped"
-    shim_status = "running" if is_running(PIDFILE_SHIM, DEFAULT_SHIM_PORT) else "stopped"
+def stop_services(paths: RuntimePaths | None = None) -> None:
+    """Stop all background services."""
+    paths = paths or runtime_paths()
+    _stop_pid(paths.shim_pid, "Shim")
+    _stop_pid(paths.litellm_pid, "LiteLLM")
 
-    if litellm_status == "running":
-        pid = int(PIDFILE_LITELLM.read_text().strip())
-        print(f"LiteLLM: running (pid {pid})")
+
+def show_status(settings: Settings, paths: RuntimePaths | None = None) -> None:
+    """Print service status."""
+    paths = paths or runtime_paths()
+
+    litellm_running = _is_running(paths.litellm_pid, settings.host, settings.litellm_port)
+    shim_running = _is_running(paths.shim_pid, settings.host, settings.shim_port)
+
+    if litellm_running:
+        litellm_pid = paths.litellm_pid.read_text(encoding="utf-8").strip()
+        print(f"LiteLLM: running (pid {litellm_pid})")
     else:
         print("LiteLLM: stopped")
 
-    if shim_status == "running":
-        pid = int(PIDFILE_SHIM.read_text().strip())
-        print(f"Shim:    running (pid {pid})")
+    if shim_running:
+        shim_pid = paths.shim_pid.read_text(encoding="utf-8").strip()
+        print(f"Shim:    running (pid {shim_pid})")
     else:
         print("Shim:    stopped")
 
 
-def show_logs() -> None:
-    """Show service logs."""
-    print("=== LiteLLM (last 20 lines) ===")
-    if LOGFILE_LITELLM.exists():
-        subprocess.run(["tail", "-20", str(LOGFILE_LITELLM)])
-    else:
-        print("(no log)")
+def show_logs(paths: RuntimePaths | None = None, lines: int = DEFAULT_LOG_LINES) -> None:
+    """Print tail of service logs."""
+    paths = paths or runtime_paths()
 
-    print()
-    print("=== Shim (last 20 lines) ===")
-    if LOGFILE_SHIM.exists():
-        subprocess.run(["tail", "-20", str(LOGFILE_SHIM)])
-    else:
-        print("(no log)")
+    print("=== LiteLLM ===")
+    print(_tail_file(paths.litellm_log, lines))
+    print("\n=== Shim ===")
+    print(_tail_file(paths.shim_log, lines))
 
 
-def emit_env() -> str:
-    """Emit environment variables for Claude."""
-    return f"""export ANTHROPIC_BASE_URL="http://{DEFAULT_HOST}:{DEFAULT_SHIM_PORT}"
-export ANTHROPIC_MODEL="{DEFAULT_MODEL}"
-export ANTHROPIC_API_KEY="sk-litellm-local"
-unset CLAUDE_CODE_USE_BEDROCK
-unset CLAUDE_CODE_USE_VERTEX
-unset CLAUDE_CODE_USE_FOUNDRY
-export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
-export CLAUDE_CODE_SKIP_VERTEX_AUTH=1
-export CLAUDE_CODE_SKIP_FOUNDRY_AUTH=1
-export CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING=1
-"""
+def run_doctor(settings: Settings, paths: RuntimePaths | None = None) -> bool:
+    """Run environment checks and return success status."""
+    paths = paths or runtime_paths()
+
+    checks: list[tuple[str, bool, str]] = []
+
+    litellm_ok, litellm_msg = _check_command("litellm")
+    checks.append(("litellm executable", litellm_ok, litellm_msg))
+
+    claude_ok, claude_msg = _check_command("claude")
+    checks.append(("claude executable", claude_ok, claude_msg))
+
+    config_path = _config_file()
+    checks.append(("config file", config_path.exists(), str(config_path)))
+
+    template_ok = True
+    try:
+        ensure_litellm_config()
+        template_msg = str(_config_dir() / "litellm.yaml")
+    except Exception as exc:
+        template_ok = False
+        template_msg = str(exc)
+    checks.append(("litellm config", template_ok, template_msg))
+
+    data_dir_ok = paths.base_dir.exists() and os.access(paths.base_dir, os.W_OK)
+    checks.append(("runtime dir writable", data_dir_ok, str(paths.base_dir)))
+
+    port1_ok, port1_msg = _doctor_port_check(
+        paths.litellm_pid, "LiteLLM", settings.host, settings.litellm_port
+    )
+    checks.append((f"port {settings.litellm_port}", port1_ok, port1_msg))
+
+    port2_ok, port2_msg = _doctor_port_check(
+        paths.shim_pid, "shim", settings.host, settings.shim_port
+    )
+    checks.append((f"port {settings.shim_port}", port2_ok, port2_msg))
+
+    aws_ok, aws_msg = _aws_signal(settings)
+    checks.append(("AWS credential signal", aws_ok, aws_msg))
+
+    all_good = True
+    for name, ok, detail in checks:
+        status = "OK" if ok else "FAIL"
+        print(f"[{status}] {name}: {detail}")
+        if not ok:
+            all_good = False
+
+    if not all_good:
+        print("\nSuggested fixes:")
+        if not litellm_ok:
+            print("- Install kimicc in a venv or pipx so `litellm` is on PATH.")
+        if not claude_ok:
+            print("- Install Claude Code CLI and confirm `claude` is on PATH.")
+        if not port1_ok or not port2_ok:
+            print("- Run `kimicc status` and `kimicc down`, or change configured ports.")
+        if not aws_ok:
+            print("- Set `AWS_PROFILE` or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`.")
+
+    return all_good
 
 
-def print_env_help(kimicc_home: Path) -> None:
-    """Print environment setup help."""
-    print()
-    print("To use Kimi K2.5 with Claude Code, run:")
-    print()
-    print(f"  eval \"$(kimicc --env)\"")
-    print("  claude")
-    print()
+def run_health(settings: Settings, paths: RuntimePaths | None = None) -> bool:
+    """Run runtime health checks against the local services."""
+    paths = paths or runtime_paths()
+    checks: list[tuple[str, bool, str]] = []
+
+    litellm_running = _is_running(paths.litellm_pid, settings.host, settings.litellm_port)
+    checks.append(("LiteLLM process", litellm_running, "running" if litellm_running else "stopped"))
+
+    litellm_port_ok = _port_listening(settings.host, settings.litellm_port)
+    checks.append(("LiteLLM port", litellm_port_ok, f"{settings.host}:{settings.litellm_port}"))
+
+    shim_running = _is_running(paths.shim_pid, settings.host, settings.shim_port)
+    checks.append(("Shim process", shim_running, "running" if shim_running else "stopped"))
+
+    shim_health_ok, shim_health_msg = _http_ok(f"http://{settings.host}:{settings.shim_port}/health")
+    checks.append(("Shim health endpoint", shim_health_ok, shim_health_msg))
+
+    all_good = True
+    for name, ok, detail in checks:
+        status = "OK" if ok else "FAIL"
+        print(f"[{status}] {name}: {detail}")
+        if not ok:
+            all_good = False
+
+    return all_good
 
 
-def launch_claude(claude_args: list) -> None:
-    """Launch Claude with the configured environment."""
-    env_setup = emit_env()
-    for line in env_setup.strip().split("\n"):
-        if line.startswith("export "):
-            key, val = line[7:].split("=", 1)
-            os.environ[key] = val.strip('"')
-        elif line.startswith("unset "):
-            key = line[6:]
-            os.environ.pop(key, None)
+def config_command(command: str) -> int:
+    """Run config subcommands."""
+    config_path = _config_file()
+    if command == "path":
+        print(config_path)
+        return 0
 
-    print()
-    print("✓ Services ready. Launching Claude with kimi-k2.5 backend...")
-    if claude_args:
-        print(f"  Claude arguments: {' '.join(claude_args)}")
-    print()
+    if command == "show":
+        cfg = load_user_config()
+        print(yaml.safe_dump(cfg, sort_keys=False).rstrip())
+        return 0
 
-    # Replace current process with claude
-    if claude_args:
-        os.execvp("claude", ["claude"] + claude_args)
-    else:
-        os.execvp("claude", ["claude"])
+    if command == "init":
+        cfg = _default_config()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        ensure_litellm_config()
+        print(f"Initialized config at {config_path}")
+        return 0
 
+    if command == "edit":
+        load_user_config()
+        editor = os.getenv("EDITOR") or os.getenv("VISUAL")
+        if not editor:
+            print("ERROR: set EDITOR or VISUAL to use `kimicc config edit`", file=sys.stderr)
+            return 1
+        cmd = [*shlex.split(editor), str(config_path)]
+        try:
+            return subprocess.run(cmd, check=False).returncode
+        except FileNotFoundError:
+            print(f"ERROR: editor not found: {editor}", file=sys.stderr)
+            return 1
 
-def show_quick_help() -> None:
-    """Show quick help message."""
-    print("""kimicc - Claude Code with Kimi K2.5 backend
-
-Usage: kimicc [OPTIONS] [-- CLAUDE_ARGS...]
-
-Kimi Options:
-  --start              Start LiteLLM + Shim services
-  --stop               Stop services
-  --status             Check if services are running
-  --logs               Show service logs
-  --restart            Restart services
-  --env                Print environment variables for Claude
-  --aws-profile NAME   Use AWS profile (default: from env/AWS_DEFAULT_PROFILE)
-  -h, --help           Show this help message
-
-Claude Arguments:
-  All arguments after "--" are passed to Claude Code:
-    kimicc -- --dangerously-skip-permissions
-  Or pass directly:
-    kimicc --dangerously-skip-permissions
-
-Examples:
-  kimicc                           # Start services, launch Claude
-  kimicc -- --help                 # Show Claude's help
-  kimicc --stop                    # Stop background services
-  kimicc --aws-profile bedrock     # Use specific AWS profile
-
-Full help: kimicc --help
-""")
+    print(f"ERROR: unknown config subcommand '{command}'", file=sys.stderr)
+    return 2
 
 
-def show_full_help() -> None:
-    """Show full help message."""
-    print("""kimicc - Claude Code with Kimi K2.5 backend
-
-Usage: kimicc [OPTIONS] [-- CLAUDE_ARGS...]
-
-Kimi Options:
-  --start              Start LiteLLM + Shim services only
-  --stop               Stop services
-  --status             Check if services are running
-  --logs               Show service logs
-  --restart            Restart services
-  --env                Print environment setup (eval with: eval "$(kimicc --env)")
-  --aws-profile NAME   Use AWS profile for Bedrock authentication
-                       (can also use AWS_PROFILE env var)
-  -h, --help           Show this help message
-
-Claude Arguments:
-  Pass arguments after "--":
-    kimicc -- --dangerously-skip-permissions
-    kimicc -- --dangerously-skip-permissions --no-session-persistence
-
-  Or pass directly:
-    kimicc --dangerously-skip-permissions
-
-Examples:
-  # Start services and launch Claude
-  kimicc
-
-  # Start services only (for manual claude launch)
-  kimicc --start
-
-  # Stop services
-  kimicc --stop
-
-  # Check status
-  kimicc --status
-
-  # View logs
-  kimicc --logs
-
-  # Use specific AWS profile
-  kimicc --aws-profile bedrock-kimi
-
-  # Pass arguments to Claude
-  kimicc -- --dangerously-skip-permissions
-
-  # Launch in specific directory
-  kimicc -- -d /path/to/project
-
-Architecture:
-  Claude Code → Kimicc Shim → LiteLLM → AWS Bedrock (Kimi K2.5)
-
-Environment Variables:
-  KIMICC_HOME          Override installation directory
-  AWS_PROFILE          AWS profile for Bedrock access
-  CLAUDE_CODE_ARGS     Default arguments passed to Claude
-
-For more information: https://github.com/jswift24/kimicc
-""")
+def _split_default_claude_args(config_args: list[str]) -> list[str]:
+    env_default = os.getenv("CLAUDE_CODE_ARGS", "")
+    from_env = shlex.split(env_default) if env_default else []
+    return [*config_args, *from_env]
 
 
-def main() -> None:
+def _settings_from(config: dict[str, Any], args: argparse.Namespace) -> Settings:
+    host = getattr(args, "host", None) or config.get("host", DEFAULT_HOST)
+    model = getattr(args, "model", None) or config.get("model", DEFAULT_MODEL)
+
+    config_ports = config.get("ports") or {}
+    litellm_port = getattr(args, "litellm_port", None) or int(config_ports.get("litellm", DEFAULT_LITELLM_PORT))
+    shim_port = getattr(args, "shim_port", None) or int(config_ports.get("shim", DEFAULT_SHIM_PORT))
+
+    aws_profile = (
+        getattr(args, "aws_profile", None)
+        if getattr(args, "aws_profile", None) is not None
+        else config.get("aws_profile")
+    )
+
+    logs_cfg = config.get("logs") or {}
+    log_lines = int(getattr(args, "lines", None) or logs_cfg.get("lines", DEFAULT_LOG_LINES))
+
+    config_claude_args = config.get("claude_args", [])
+    if not isinstance(config_claude_args, list):
+        config_claude_args = []
+
+    default_claude_args = _split_default_claude_args([str(x) for x in config_claude_args])
+
+    return Settings(
+        host=str(host),
+        model=str(model),
+        litellm_port=litellm_port,
+        shim_port=shim_port,
+        aws_profile=str(aws_profile) if aws_profile else None,
+        default_claude_args=default_claude_args,
+        log_lines=log_lines,
+    )
+
+
+def _add_network_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", default=None, help="Host for LiteLLM and shim (default from config)")
+    parser.add_argument("--model", default=None, help="Model name exposed to Claude (default from config)")
+    parser.add_argument("--litellm-port", type=int, default=None, help="LiteLLM port override")
+    parser.add_argument("--shim-port", type=int, default=None, help="Shim port override")
+
+
+def _add_aws_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--aws-profile", default=None, help="AWS profile override")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser with explicit subcommands."""
+    parser = argparse.ArgumentParser(
+        prog="kimicc",
+        description="Run Claude Code with a local Kimi-compatible shim backend",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_cmd = subparsers.add_parser("run", help="Start services and launch Claude")
+    _add_network_flags(run_cmd)
+    _add_aws_flag(run_cmd)
+    run_cmd.add_argument("claude_args", nargs="*", help="Arguments forwarded to claude after '--'")
+
+    up_cmd = subparsers.add_parser("up", help="Start background services")
+    _add_network_flags(up_cmd)
+    _add_aws_flag(up_cmd)
+    up_cmd.add_argument("--wait", action="store_true", help="Wait for service readiness checks before exiting")
+    up_cmd.add_argument("--timeout", type=float, default=10.0, help="Readiness timeout for --wait")
+
+    subparsers.add_parser("down", help="Stop background services")
+
+    restart_cmd = subparsers.add_parser("restart", help="Restart background services only")
+    _add_network_flags(restart_cmd)
+    _add_aws_flag(restart_cmd)
+
+    status_cmd = subparsers.add_parser("status", help="Show service status")
+    _add_network_flags(status_cmd)
+
+    logs_cmd = subparsers.add_parser("logs", help="Show service logs")
+    logs_cmd.add_argument("--lines", type=int, default=None, help="Number of lines per log")
+
+    env_cmd = subparsers.add_parser("env", help="Print environment exports for manual Claude launch")
+    env_cmd.add_argument("--host", default=None, help="Shim host override")
+    env_cmd.add_argument("--model", default=None, help="Model override")
+    env_cmd.add_argument("--shim-port", type=int, default=None, help="Shim port override")
+
+    doctor_cmd = subparsers.add_parser("doctor", help="Check local kimicc readiness")
+    _add_network_flags(doctor_cmd)
+    _add_aws_flag(doctor_cmd)
+
+    health_cmd = subparsers.add_parser("health", help="Check runtime health of running services")
+    _add_network_flags(health_cmd)
+
+    config_cmd = subparsers.add_parser("config", help="Manage kimicc configuration")
+    config_subparsers = config_cmd.add_subparsers(dest="config_command")
+    config_subparsers.add_parser("path", help="Print config file path")
+    config_subparsers.add_parser("show", help="Print merged config")
+    config_subparsers.add_parser("init", help="Write default config and bundled templates")
+    config_subparsers.add_parser("edit", help="Open config.yaml in $EDITOR")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
-    # Parse arguments manually to handle -- separator
-    args = sys.argv[1:]
-    claude_args: list[str] = []
-    kimicc_args: list[str] = []
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-    # Check for -- separator
-    if "--" in args:
-        sep_idx = args.index("--")
-        kimicc_args = args[:sep_idx]
-        claude_args = args[sep_idx + 1:]
-    else:
-        # No separator - try to distinguish kimicc args from claude args
-        kimicc_flags = {"--start", "--stop", "--status", "--logs", "--restart", "--env", "--help", "-h", "--aws-profile"}
-        i = 0
-        while i < len(args):
-            if args[i] in kimicc_flags:
-                kimicc_args.append(args[i])
-                i += 1
-                if args[i-1] == "--aws-profile" and i < len(args) and not args[i].startswith("-"):
-                    kimicc_args.append(args[i])
-                    i += 1
-            elif args[i].startswith("--"):
-                # Unknown flag - could be claude arg
-                claude_args.extend(args[i:])
-                break
-            else:
-                # Positional arg - pass to claude
-                claude_args.extend(args[i:])
-                break
+    if not args.command:
+        parser.print_help()
+        return 0
 
-    # Also check CLAUDE_CODE_ARGS env var
-    env_claude_args = os.environ.get("CLAUDE_CODE_ARGS", "")
-    if env_claude_args:
-        claude_args = env_claude_args.split() + claude_args
+    config = load_user_config()
+    settings = _settings_from(config, args)
+    paths = runtime_paths()
 
-    # Parse kimicc arguments
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--start", action="store_true")
-    parser.add_argument("--stop", action="store_true")
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--logs", action="store_true")
-    parser.add_argument("--restart", action="store_true")
-    parser.add_argument("--env", action="store_true")
-    parser.add_argument("--aws-profile", default=None)
-    parser.add_argument("--help", "-h", action="store_true")
+    try:
+        if args.command == "down":
+            stop_services(paths)
+            return 0
 
-    parsed, _ = parser.parse_known_args(kimicc_args)
+        if args.command == "status":
+            show_status(settings, paths)
+            return 0
 
-    # Handle help
-    if parsed.help or "-h" in kimicc_args:
-        if len(kimicc_args) == 1 and (kimicc_args[0] == "-h" or kimicc_args[0] == "--help"):
-            show_quick_help()
-        else:
-            show_full_help()
-        return
+        if args.command == "logs":
+            show_logs(paths, settings.log_lines)
+            return 0
 
-    # Get kimicc home
-    kimicc_home = get_kimicc_home()
+        if args.command == "env":
+            print(emit_env(settings))
+            return 0
 
-    aws_profile = parsed.aws_profile or os.environ.get("AWS_PROFILE")
+        if args.command == "doctor":
+            return 0 if run_doctor(settings, paths) else 1
 
-    # Handle commands
-    if parsed.stop:
-        stop_services()
-        return
+        if args.command == "health":
+            return 0 if run_health(settings, paths) else 1
 
-    if parsed.status:
-        show_status()
-        return
+        if args.command == "config":
+            if not args.config_command:
+                parser.error("config command requires one of: path, show, init, edit")
+            return config_command(args.config_command)
 
-    if parsed.logs:
-        show_logs()
-        return
+        if args.command == "up":
+            start_services(settings, paths)
+            if args.wait:
+                deadline = time.time() + max(0.1, float(args.timeout))
+                while time.time() < deadline:
+                    if run_health(settings, paths):
+                        break
+                    time.sleep(0.5)
+            print("\nServices are running. Use `kimicc run` to launch Claude.")
+            return 0
 
-    if parsed.env:
-        print(emit_env())
-        return
+        if args.command == "restart":
+            stop_services(paths)
+            time.sleep(0.3)
+            start_services(settings, paths)
+            return 0
 
-    if parsed.restart:
-        stop_services()
-        time.sleep(1)
-        start_litellm(kimicc_home, DEFAULT_HOST, DEFAULT_LITELLM_PORT, aws_profile)
-        start_shim(kimicc_home, DEFAULT_HOST, DEFAULT_SHIM_PORT, DEFAULT_LITELLM_PORT)
-        launch_claude(claude_args)
-        return
+        if args.command == "run":
+            start_services(settings, paths)
+            passthrough_args = list(args.claude_args)
+            if passthrough_args and passthrough_args[0] == "--":
+                passthrough_args = passthrough_args[1:]
+            cli_args = [*settings.default_claude_args, *passthrough_args]
+            launch_claude(settings, cli_args)
+            return 0
 
-    # Start services
-    start_litellm(kimicc_home, DEFAULT_HOST, DEFAULT_LITELLM_PORT, aws_profile)
-    start_shim(kimicc_home, DEFAULT_HOST, DEFAULT_SHIM_PORT, DEFAULT_LITELLM_PORT)
+        parser.error(f"Unknown command: {args.command}")
+        return 2
 
-    if parsed.start:
-        # Just start services, don't launch claude
-        print_env_help(kimicc_home)
-        return
-
-    # Launch claude with all collected arguments
-    launch_claude(claude_args)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"ERROR: required executable not found: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
