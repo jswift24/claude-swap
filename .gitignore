@@ -59,7 +59,7 @@ cover/
 .DS_Store
 Thumbs.db
 
-# Kimicc specific
+# cbridge specific
 /tmp/cbridge/
 /tmp/claude-kimi-*.pid
 /tmp/claude-kimi-*.log
