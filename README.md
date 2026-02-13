@@ -1,8 +1,8 @@
-# Kimicc
+# cbridge
 
 Use Claude Code with Kimi K2.5 on AWS Bedrock through a local compatibility shim.
 
-Kimicc runs two local services:
+cbridge runs two local services:
 1. LiteLLM proxy (Bedrock backend)
 2. Anthropic-compatible shim for Claude Code
 
@@ -69,7 +69,7 @@ cbridge config path|show|init|edit  # Discover/manage config files
 
 ## Configuration
 
-Kimicc auto-creates user config on first run:
+cbridge auto-creates user config on first run:
 
 - `~/.config/cbridge/config.yaml`
 - `~/.config/cbridge/litellm.yaml`
@@ -97,7 +97,7 @@ Runtime files are user-scoped (not global `/tmp`):
 
 ## AWS Authentication
 
-Kimicc relies on the standard AWS credential chain used by LiteLLM/Bedrock.
+cbridge relies on the standard AWS credential chain used by LiteLLM/Bedrock.
 
 Common options:
 
@@ -125,7 +125,7 @@ cbridge health
 ## Architecture
 
 ```text
-Claude Code -> Kimicc Shim (4001) -> LiteLLM (4000) -> AWS Bedrock (Kimi K2.5)
+Claude Code -> cbridge Shim (4001) -> LiteLLM (4000) -> AWS Bedrock (Kimi K2.5)
 ```
 
 The shim normalizes compatibility details Claude Code expects, including:
