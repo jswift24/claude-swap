@@ -7,15 +7,8 @@ import pytest
 from claude_swap import cli
 
 
-def test_build_parser_uses_explicit_subcommands() -> None:
-    parser = cli.build_parser()
-    args = parser.parse_args(["run", "--", "--dangerously-skip-permissions"])
-    assert args.command == "run"
-    assert args.claude_args == ["--dangerously-skip-permissions"]
-
-
-def test_build_parser_includes_health_and_config_commands() -> None:
-    parser = cli.build_parser()
+def test_service_parser_uses_explicit_subcommands() -> None:
+    parser = cli.build_service_parser()
     health_args = parser.parse_args(["health"])
     config_args = parser.parse_args(["config", "path"])
     config_edit_args = parser.parse_args(["config", "edit"])
@@ -26,8 +19,8 @@ def test_build_parser_includes_health_and_config_commands() -> None:
     assert config_edit_args.config_command == "edit"
 
 
-def test_down_rejects_unused_host_flag() -> None:
-    parser = cli.build_parser()
+def test_down_does_not_accept_host_flag() -> None:
+    parser = cli.build_service_parser()
 
     with pytest.raises(SystemExit):
         parser.parse_args(["down", "--host", "127.0.0.1"])
@@ -69,18 +62,19 @@ def test_restart_restarts_background_services_only(monkeypatch: pytest.MonkeyPat
     assert calls == [("stop", None), ("start", None)]
 
 
-def test_run_starts_services_and_launches_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_passthrough_starts_services_and_launches_claude(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, list[str] | None]] = []
 
-    monkeypatch.setattr(cli, "stop_services", lambda *_args, **_kwargs: calls.append(("stop", None)))
-    monkeypatch.setattr(cli, "start_services", lambda *_args, **_kwargs: calls.append(("start", None)))
-    monkeypatch.setattr(cli, "launch_claude", lambda _settings, args: calls.append(("launch", list(args))))
+    monkeypatch.setattr(cli, "ensure_services_running", lambda *_args, **_kwargs: calls.append(("ensure", None)))
+    monkeypatch.setattr(cli, "_apply_env_exports", lambda *_args, **_kwargs: calls.append(("env", None)))
+    monkeypatch.setattr(cli, "launch_claude", lambda args: calls.append(("launch", list(args))))
 
-    exit_code = cli.main(["run", "--", "--dangerously-skip-permissions"])
+    exit_code = cli.main(["--dangerously-skip-permissions"])
 
     assert exit_code == 0
     assert calls == [
-        ("start", None),
+        ("ensure", None),
+        ("env", None),
         ("launch", ["--dangerously-skip-permissions"]),
     ]
 
@@ -103,7 +97,7 @@ def test_doctor_accepts_ports_in_use_when_service_is_running(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
 
     config = cli.load_user_config()
-    settings = cli._settings_from(config, cli.build_parser().parse_args(["doctor"]))
+    settings = cli._settings_from(config, cli.build_service_parser().parse_args(["doctor"]))
     paths = cli.runtime_paths()
 
     monkeypatch.setattr(cli, "_check_command", lambda _name: (True, "/bin/fake"))

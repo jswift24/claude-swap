@@ -872,6 +872,50 @@ async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.get("/v1/models")
+async def list_models() -> JSONResponse:
+    """
+    Return available models for Claude Code.
+
+    Exposes kimi-k2.5 as the primary model, plus aliases for common
+    Anthropic model names that we transparently rewrite to kimi-k2.5.
+    """
+    models = [
+        {
+            "id": DEFAULT_MODEL,  # kimi-k2.5
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "moonshot-ai",
+        },
+        # Aliases for transparent compatibility
+        {
+            "id": "claude-opus-4",
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-sonnet-4",
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-3-opus-20240229",
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-3-sonnet-20240229",
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "anthropic",
+        },
+    ]
+    return JSONResponse({"object": "list", "data": models})
+
+
 if __name__ == "__main__":
     import uvicorn
 

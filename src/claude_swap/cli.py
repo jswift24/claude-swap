@@ -1,4 +1,16 @@
-"""CLI entry point for claude-swap."""
+"""CLI entry point for claude-swap.
+
+claude-swap is a drop-in replacement for the `claude` command that routes
+Claude Code through a local shim to use Kimi K2.5 via AWS Bedrock.
+
+Usage:
+    claude-swap [CLAUDE_ARGS...]     # Run Claude with Kimi backend
+    claude-swap up                   # Start background services
+    claude-swap down                 # Stop background services
+    claude-swap status               # Check service status
+    claude-swap logs                 # View service logs
+    claude-swap config init          # Initialize configuration
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,7 +26,7 @@ from collections import deque
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
 import yaml
@@ -25,6 +37,9 @@ DEFAULT_MODEL = "kimi-k2.5"
 DEFAULT_LITELLM_PORT = 4000
 DEFAULT_SHIM_PORT = 4001
 DEFAULT_LOG_LINES = 50
+
+# Subcommands that claude-swap handles itself (not passed to Claude)
+SERVICE_COMMANDS = {"up", "down", "status", "logs", "restart", "env", "doctor", "health", "config", "help"}
 
 
 @dataclass(frozen=True)
@@ -43,7 +58,6 @@ class Settings:
     litellm_port: int
     shim_port: int
     aws_profile: str | None
-    default_claude_args: list[str]
     log_lines: int
 
 
@@ -56,7 +70,6 @@ def _default_config() -> dict[str, Any]:
             "litellm": DEFAULT_LITELLM_PORT,
             "shim": DEFAULT_SHIM_PORT,
         },
-        "claude_args": [],
         "logs": {"lines": DEFAULT_LOG_LINES},
     }
 
@@ -251,23 +264,21 @@ def _apply_env_exports(settings: Settings) -> None:
     os.environ["CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
 
 
-def launch_claude(settings: Settings, claude_args: Iterable[str]) -> None:
+def launch_claude(claude_args: list[str]) -> None:
     """Launch Claude with the configured environment."""
-    _apply_env_exports(settings)
-    args = list(claude_args)
+    if not shutil.which("claude"):
+        print("ERROR: 'claude' not found in PATH. Install Claude Code CLI first.", file=sys.stderr)
+        sys.exit(1)
 
-    print("\nServices ready. Launching Claude with claude-swap backend...")
-    if args:
-        print(f"  Claude arguments: {' '.join(args)}")
-
-    os.execvp("claude", ["claude", *args])
+    os.execvp("claude", ["claude", *claude_args])
 
 
-def start_litellm(settings: Settings, paths: RuntimePaths) -> None:
+def start_litellm(settings: Settings, paths: RuntimePaths, verbose: bool = True) -> None:
     """Start LiteLLM if needed."""
     if _is_running(paths.litellm_pid, settings.host, settings.litellm_port):
-        pid = int(paths.litellm_pid.read_text(encoding="utf-8").strip())
-        print(f"LiteLLM already running (pid {pid})")
+        if verbose:
+            pid = int(paths.litellm_pid.read_text(encoding="utf-8").strip())
+            print(f"LiteLLM already running (pid {pid})")
         return
 
     litellm_bin = shutil.which("litellm")
@@ -301,14 +312,16 @@ def start_litellm(settings: Settings, paths: RuntimePaths) -> None:
     if not _wait_for_ready(paths.litellm_pid, settings.host, settings.litellm_port, 30.0, proc):
         raise RuntimeError(f"LiteLLM failed to start. Check {paths.litellm_log}")
 
-    print(f"LiteLLM ready (pid {proc.pid})")
+    if verbose:
+        print(f"LiteLLM ready (pid {proc.pid})")
 
 
-def start_shim(settings: Settings, paths: RuntimePaths) -> None:
+def start_shim(settings: Settings, paths: RuntimePaths, verbose: bool = True) -> None:
     """Start shim if needed."""
     if _is_running(paths.shim_pid, settings.host, settings.shim_port):
-        pid = int(paths.shim_pid.read_text(encoding="utf-8").strip())
-        print(f"Shim already running (pid {pid})")
+        if verbose:
+            pid = int(paths.shim_pid.read_text(encoding="utf-8").strip())
+            print(f"Shim already running (pid {pid})")
         return
 
     env = os.environ.copy()
@@ -342,14 +355,28 @@ def start_shim(settings: Settings, paths: RuntimePaths) -> None:
     if not _wait_for_ready(paths.shim_pid, settings.host, settings.shim_port, 20.0, proc):
         raise RuntimeError(f"Shim failed to start. Check {paths.shim_log}")
 
-    print(f"Shim ready (pid {proc.pid})")
+    if verbose:
+        print(f"Shim ready (pid {proc.pid})")
 
 
-def start_services(settings: Settings, paths: RuntimePaths | None = None) -> None:
+def start_services(settings: Settings, paths: RuntimePaths | None = None, verbose: bool = True) -> None:
     """Start all background services."""
     paths = paths or runtime_paths()
-    start_litellm(settings, paths)
-    start_shim(settings, paths)
+    start_litellm(settings, paths, verbose=verbose)
+    start_shim(settings, paths, verbose=verbose)
+
+
+def ensure_services_running(settings: Settings, paths: RuntimePaths | None = None) -> None:
+    """Ensure services are running (silent if already running, starts them if not)."""
+    paths = paths or runtime_paths()
+    litellm_was_running = _is_running(paths.litellm_pid, settings.host, settings.litellm_port)
+    shim_was_running = _is_running(paths.shim_pid, settings.host, settings.shim_port)
+
+    if litellm_was_running and shim_was_running:
+        return  # Everything already running
+
+    # Start what's needed
+    start_services(settings, paths, verbose=not (litellm_was_running and shim_was_running))
 
 
 def _stop_pid(pid_file: Path, name: str) -> None:
@@ -549,12 +576,6 @@ def config_command(command: str) -> int:
     return 2
 
 
-def _split_default_claude_args(config_args: list[str]) -> list[str]:
-    env_default = os.getenv("CLAUDE_CODE_ARGS", "")
-    from_env = shlex.split(env_default) if env_default else []
-    return [*config_args, *from_env]
-
-
 def _settings_from(config: dict[str, Any], args: argparse.Namespace) -> Settings:
     host = getattr(args, "host", None) or config.get("host", DEFAULT_HOST)
     model = getattr(args, "model", None) or config.get("model", DEFAULT_MODEL)
@@ -572,96 +593,134 @@ def _settings_from(config: dict[str, Any], args: argparse.Namespace) -> Settings
     logs_cfg = config.get("logs") or {}
     log_lines = int(getattr(args, "lines", None) or logs_cfg.get("lines", DEFAULT_LOG_LINES))
 
-    config_claude_args = config.get("claude_args", [])
-    if not isinstance(config_claude_args, list):
-        config_claude_args = []
-
-    default_claude_args = _split_default_claude_args([str(x) for x in config_claude_args])
-
     return Settings(
         host=str(host),
         model=str(model),
         litellm_port=litellm_port,
         shim_port=shim_port,
         aws_profile=str(aws_profile) if aws_profile else None,
-        default_claude_args=default_claude_args,
         log_lines=log_lines,
     )
 
 
-def _add_network_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", default=None, help="Host for LiteLLM and shim (default from config)")
-    parser.add_argument("--model", default=None, help="Model name exposed to Claude (default from config)")
-    parser.add_argument("--litellm-port", type=int, default=None, help="LiteLLM port override")
-    parser.add_argument("--shim-port", type=int, default=None, help="Shim port override")
-
-
-def _add_aws_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--aws-profile", default=None, help="AWS profile override")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser with explicit subcommands."""
+def build_service_parser() -> argparse.ArgumentParser:
+    """Build parser for service management subcommands."""
     parser = argparse.ArgumentParser(
         prog="claude-swap",
-        description="Run Claude Code with a local Kimi-compatible shim backend",
+        description="Run Claude Code with Kimi K2.5 backend via AWS Bedrock",
+        add_help=False,
     )
 
     subparsers = parser.add_subparsers(dest="command")
 
-    run_cmd = subparsers.add_parser("run", help="Start services and launch Claude")
-    _add_network_flags(run_cmd)
-    _add_aws_flag(run_cmd)
-    run_cmd.add_argument("claude_args", nargs="*", help="Arguments forwarded to claude after '--'")
-
+    # Service management subcommands
     up_cmd = subparsers.add_parser("up", help="Start background services")
-    _add_network_flags(up_cmd)
-    _add_aws_flag(up_cmd)
-    up_cmd.add_argument("--wait", action="store_true", help="Wait for service readiness checks before exiting")
-    up_cmd.add_argument("--timeout", type=float, default=10.0, help="Readiness timeout for --wait")
+    up_cmd.add_argument("--host", default=None)
+    up_cmd.add_argument("--model", default=None)
+    up_cmd.add_argument("--litellm-port", type=int, default=None)
+    up_cmd.add_argument("--shim-port", type=int, default=None)
+    up_cmd.add_argument("--aws-profile", default=None)
+    up_cmd.add_argument("--wait", action="store_true")
+    up_cmd.add_argument("--timeout", type=float, default=10.0)
 
     subparsers.add_parser("down", help="Stop background services")
 
-    restart_cmd = subparsers.add_parser("restart", help="Restart background services only")
-    _add_network_flags(restart_cmd)
-    _add_aws_flag(restart_cmd)
+    restart_cmd = subparsers.add_parser("restart", help="Restart background services")
+    restart_cmd.add_argument("--host", default=None)
+    restart_cmd.add_argument("--model", default=None)
+    restart_cmd.add_argument("--litellm-port", type=int, default=None)
+    restart_cmd.add_argument("--shim-port", type=int, default=None)
+    restart_cmd.add_argument("--aws-profile", default=None)
 
     status_cmd = subparsers.add_parser("status", help="Show service status")
-    _add_network_flags(status_cmd)
+    status_cmd.add_argument("--host", default=None)
+    status_cmd.add_argument("--litellm-port", type=int, default=None)
+    status_cmd.add_argument("--shim-port", type=int, default=None)
 
     logs_cmd = subparsers.add_parser("logs", help="Show service logs")
-    logs_cmd.add_argument("--lines", type=int, default=None, help="Number of lines per log")
+    logs_cmd.add_argument("--lines", type=int, default=None)
 
-    env_cmd = subparsers.add_parser("env", help="Print environment exports for manual Claude launch")
-    env_cmd.add_argument("--host", default=None, help="Shim host override")
-    env_cmd.add_argument("--model", default=None, help="Model override")
-    env_cmd.add_argument("--shim-port", type=int, default=None, help="Shim port override")
+    env_cmd = subparsers.add_parser("env", help="Print environment exports")
+    env_cmd.add_argument("--host", default=None)
+    env_cmd.add_argument("--model", default=None)
+    env_cmd.add_argument("--shim-port", type=int, default=None)
 
-    doctor_cmd = subparsers.add_parser("doctor", help="Check local claude-swap readiness")
-    _add_network_flags(doctor_cmd)
-    _add_aws_flag(doctor_cmd)
+    doctor_cmd = subparsers.add_parser("doctor", help="Check readiness")
+    doctor_cmd.add_argument("--host", default=None)
+    doctor_cmd.add_argument("--model", default=None)
+    doctor_cmd.add_argument("--litellm-port", type=int, default=None)
+    doctor_cmd.add_argument("--shim-port", type=int, default=None)
+    doctor_cmd.add_argument("--aws-profile", default=None)
 
-    health_cmd = subparsers.add_parser("health", help="Check runtime health of running services")
-    _add_network_flags(health_cmd)
+    health_cmd = subparsers.add_parser("health", help="Check service health")
+    health_cmd.add_argument("--host", default=None)
+    health_cmd.add_argument("--litellm-port", type=int, default=None)
+    health_cmd.add_argument("--shim-port", type=int, default=None)
 
-    config_cmd = subparsers.add_parser("config", help="Manage claude-swap configuration")
+    config_cmd = subparsers.add_parser("config", help="Manage configuration")
     config_subparsers = config_cmd.add_subparsers(dest="config_command")
-    config_subparsers.add_parser("path", help="Print config file path")
-    config_subparsers.add_parser("show", help="Print merged config")
-    config_subparsers.add_parser("init", help="Write default config and bundled templates")
-    config_subparsers.add_parser("edit", help="Open config.yaml in $EDITOR")
+    config_subparsers.add_parser("path")
+    config_subparsers.add_parser("show")
+    config_subparsers.add_parser("init")
+    config_subparsers.add_parser("edit")
+
+    # Help subcommand
+    subparsers.add_parser("help", help="Show this help message")
 
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Main entry point."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def show_help() -> None:
+    """Show usage help."""
+    print("""Usage: claude-swap [CLAUDE_ARGS...] | [COMMAND]
 
-    if not args.command:
-        parser.print_help()
-        return 0
+Run Claude Code with Kimi K2.5 backend via AWS Bedrock.
+
+Pass-through mode (default):
+    claude-swap --dangerously-skip-permissions
+    claude-swap --resume last
+    claude-swap --help               # Shows Claude's help
+
+Service management:
+    claude-swap up                   # Start background services
+    claude-swap down                 # Stop background services
+    claude-swap restart              # Restart background services
+    claude-swap status               # Check service status
+    claude-swap logs                 # View service logs
+    claude-swap env                  # Print environment exports
+    claude-swap doctor               # Check readiness
+    claude-swap health               # Check service health
+    claude-swap config init          # Initialize configuration
+    claude-swap help                 # Show this help
+
+Environment variables:
+    ANTHROPIC_BASE_URL               # Set by claude-swap (shim endpoint)
+    ANTHROPIC_MODEL                  # Set to kimi-k2.5
+    ANTHROPIC_API_KEY                # Set to sk-litellm-local
+    AWS_PROFILE                      # AWS profile for Bedrock access
+""")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point.
+
+    If first arg is a service command, handle it.
+    Otherwise, ensure services are running and exec Claude with all args.
+    """
+    args_list = argv if argv is not None else sys.argv[1:]
+
+    # Check if this is a service management command
+    if args_list and args_list[0] in SERVICE_COMMANDS:
+        return _handle_service_command(args_list)
+
+    # Otherwise, run in passthrough mode: ensure services and exec Claude
+    return _run_passthrough(args_list)
+
+
+def _handle_service_command(args_list: list[str]) -> int:
+    """Handle service management subcommands."""
+    parser = build_service_parser()
+    args = parser.parse_args(args_list)
 
     config = load_user_config()
     settings = _settings_from(config, args)
@@ -692,7 +751,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "config":
             if not args.config_command:
-                parser.error("config command requires one of: path, show, init, edit")
+                print("ERROR: config requires one of: path, show, init, edit", file=sys.stderr)
+                return 2
             return config_command(args.config_command)
 
         if args.command == "up":
@@ -703,7 +763,7 @@ def main(argv: list[str] | None = None) -> int:
                     if run_health(settings, paths):
                         break
                     time.sleep(0.5)
-            print("\nServices are running. Use `claude-swap run` to launch Claude.")
+            print("\nServices are running. Claude Code can be launched via 'claude-swap'.")
             return 0
 
         if args.command == "restart":
@@ -712,17 +772,45 @@ def main(argv: list[str] | None = None) -> int:
             start_services(settings, paths)
             return 0
 
-        if args.command == "run":
-            start_services(settings, paths)
-            passthrough_args = list(args.claude_args)
-            if passthrough_args and passthrough_args[0] == "--":
-                passthrough_args = passthrough_args[1:]
-            cli_args = [*settings.default_claude_args, *passthrough_args]
-            launch_claude(settings, cli_args)
+        if args.command == "help":
+            show_help()
             return 0
 
-        parser.error(f"Unknown command: {args.command}")
-        return 2
+        return 0
+
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"ERROR: required executable not found: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_passthrough(claude_args: list[str]) -> int:
+    """Ensure services are running and exec Claude with the given args."""
+    config = load_user_config()
+    # Parse minimal args for settings (no CLI parsing, just config)
+    dummy_args = argparse.Namespace(
+        host=None,
+        model=None,
+        litellm_port=None,
+        shim_port=None,
+        aws_profile=None,
+        lines=None,
+    )
+    settings = _settings_from(config, dummy_args)
+    paths = runtime_paths()
+
+    try:
+        # Start services if not already running
+        ensure_services_running(settings, paths)
+
+        # Set up environment for Claude
+        _apply_env_exports(settings)
+
+        # Exec Claude with user's args
+        launch_claude(claude_args)
+        return 0  # Never reached due to exec
 
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
