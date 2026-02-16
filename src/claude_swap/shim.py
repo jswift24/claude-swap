@@ -5,34 +5,83 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
 from urllib.parse import unquote
 
 import httpx
+import yaml
 from fastapi import FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger("claude-swap-shim")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-APP_HOST = os.getenv("SHIM_HOST", "127.0.0.1")
-APP_PORT = int(os.getenv("SHIM_PORT", "4001"))
 
-UPSTREAM_BASE = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:4000").rstrip("/")
-UPSTREAM_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S", "600"))
+def _load_config() -> Dict[str, Any]:
+    """Load shim configuration from config.yaml, falling back to defaults."""
+    defaults = {
+        "host": "127.0.0.1",
+        "port": 4001,
+        "upstream_base_url": "http://127.0.0.1:4000",
+        "upstream_timeout": 600,
+        "connect_timeout": 30,
+        "max_continuation_retries": 3,
+        "emulate_stream_for_tools": True,
+        "default_model": "kimi-k2.5",
+        "enable_web_search": True,
+        "web_search_max_results": 5,
+        "log_body": False,
+        "log_tokens": False,
+    }
+
+    # Look for config.yaml in standard locations
+    config_paths = [
+        Path(os.getenv("SHIM_CONFIG", "")),
+        Path(__file__).parent.parent.parent / "config" / "config.yaml",
+        Path.cwd() / "config" / "config.yaml",
+        Path.home() / ".config" / "claude-swap" / "config.yaml",
+    ]
+
+    for config_path in config_paths:
+        if config_path and config_path.exists():
+            try:
+                with open(config_path) as f:
+                    loaded = yaml.safe_load(f) or {}
+                    defaults.update(loaded)
+                    logger.info("Loaded config from %s", config_path)
+                    return defaults
+            except Exception as e:
+                logger.warning("Failed to load config from %s: %s", config_path, e)
+
+    logger.info("Using default configuration")
+    return defaults
+
+
+# Load configuration
+_CONFIG = _load_config()
+
+# Server settings
+APP_HOST = _CONFIG.get("host", "127.0.0.1")
+APP_PORT = int(_CONFIG.get("port", 4001))
+
+# Upstream LiteLLM settings
+UPSTREAM_BASE = _CONFIG.get("upstream_base_url", "http://127.0.0.1:4000").rstrip("/")
+UPSTREAM_TIMEOUT_S = float(_CONFIG.get("upstream_timeout", 600))
+CONNECT_TIMEOUT_S = float(_CONFIG.get("connect_timeout", 30))
 
 # Emulate streaming for tool calls by doing upstream stream=false and re-wrapping into SSE
-EMULATE_STREAM_FOR_TOOLS = os.getenv("SHIM_EMULATE_STREAM_FOR_TOOLS", "1") == "1"
+EMULATE_STREAM_FOR_TOOLS = bool(_CONFIG.get("emulate_stream_for_tools", True))
 
 # Model name normalization: rewrite all model names to this value.
 # Claude Code may send secondary requests (for web search, etc.) with different
 # model names like "claude-haiku-4-5-20251001". Since we only have one model
 # configured in LiteLLM, normalize all requests to use it.
-DEFAULT_MODEL = os.getenv("SHIM_DEFAULT_MODEL", "kimi-k2.5")
+DEFAULT_MODEL = _CONFIG.get("default_model", "kimi-k2.5")
 
 # Enable shim-side web search execution via DuckDuckGo (when the model calls web_search)
-ENABLE_WEB_SEARCH = os.getenv("SHIM_ENABLE_WEB_SEARCH", "1") == "1"
-WEB_SEARCH_MAX_RESULTS = int(os.getenv("SHIM_WEB_SEARCH_MAX_RESULTS", "5"))
+ENABLE_WEB_SEARCH = bool(_CONFIG.get("enable_web_search", True))
+WEB_SEARCH_MAX_RESULTS = int(_CONFIG.get("web_search_max_results", 5))
 
 app = FastAPI()
 
@@ -351,7 +400,7 @@ async def _execute_server_tool_calls(
     follow_up_body["messages"] = follow_up_messages
     follow_up_body["stream"] = False
 
-    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
+    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(upstream_url, headers=headers, json=follow_up_body)
@@ -472,6 +521,10 @@ _STOP_REASON_MAP = {
     "stop_sequence": "stop_sequence",
 }
 
+# Maximum retries for incomplete responses (kimi-k2.5 sometimes stalls mid-generation)
+# Configured in config.yaml
+_MAX_CONTINUATION_RETRIES = int(_CONFIG.get("max_continuation_retries", 3))
+
 
 def _normalize_stop_reason(raw: Any, content: list | None = None) -> str:
     """
@@ -492,6 +545,75 @@ def _normalize_stop_reason(raw: Any, content: list | None = None) -> str:
             if isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"}:
                 return "tool_use"
     return "end_turn"
+
+
+def _is_message_incomplete(msg: Dict[str, Any]) -> bool:
+    """
+    Detect if a response appears incomplete (kimi-k2.5 stalled mid-generation).
+
+    Returns True if:
+    - stop_reason is None (model stopped without indicating completion)
+    - Content ends mid-thinking block (thinking with no end marker)
+    - Content ends mid-tool-use (partial JSON input)
+    """
+    if not isinstance(msg, dict):
+        return False
+
+    stop_reason = msg.get("stop_reason")
+    content = msg.get("content")
+
+    # If stop_reason is explicitly set, response is complete
+    if stop_reason:
+        return False
+
+    # No stop_reason - check if content looks complete
+    if isinstance(content, list) and content:
+        last_block = content[-1]
+        if not isinstance(last_block, dict):
+            return False
+
+        btype = last_block.get("type")
+
+        # Mid-thinking: thinking block exists but no text or sentinel
+        if btype == "thinking":
+            # Check if thinking looks truncated (ends abruptly without punctuation)
+            thinking_text = last_block.get("thinking") or last_block.get("text") or ""
+            if thinking_text and not thinking_text.rstrip().endswith((".", "!", "?", "`", ")", "}")):
+                logger.info("Detected incomplete thinking block")
+                return True
+
+        # Mid-tool-use: tool_use with partial/empty input might indicate truncation
+        if btype == "tool_use":
+            inp = last_block.get("input")
+            if inp is None or (isinstance(inp, dict) and not inp):
+                logger.info("Detected potentially incomplete tool_use block")
+                return True
+
+    # No stop_reason with non-empty content suggests incomplete generation
+    if content:
+        logger.info("Detected incomplete response: no stop_reason with content present")
+        return True
+
+    return False
+
+
+def _build_continuation_request(original_body: Dict[str, Any], accumulated_content: list) -> Dict[str, Any]:
+    """
+    Build a follow-up request to continue an incomplete generation.
+
+    Appends the assistant's partial response as a message, then prompts with 'continue'.
+    """
+    new_body = dict(original_body)
+    messages = list(new_body.get("messages", []))
+
+    # Add the assistant's partial response
+    messages.append({"role": "assistant", "content": accumulated_content})
+
+    # Add continue prompt
+    messages.append({"role": "user", "content": "continue"})
+
+    new_body["messages"] = messages
+    return new_body
 
 
 def _emulate_anthropic_sse_from_message(msg: Dict[str, Any], request_tools: Optional[list] = None) -> AsyncIterator[bytes]:
@@ -657,44 +779,88 @@ async def _proxy_json(
     json_body: Dict[str, Any],
     server_tool_names: set[str] | None = None,
 ) -> Response:
-    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
+    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
     request_tools = json_body.get("tools") if isinstance(json_body, dict) else None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, headers=headers, json=json_body)
-        content_type = r.headers.get("content-type", "application/json")
 
-        # Normalize tool responses for successful JSON responses
-        if r.status_code < 400 and "application/json" in content_type:
-            try:
-                msg = r.json()
-                # Execute server-side tool calls (web_search, etc.) if present
-                if server_tool_names:
-                    msg = await _execute_server_tool_calls(
-                        msg, server_tool_names, json_body, url, headers,
-                    )
-                normalized = _normalize_tool_response(msg, request_tools)
-                normalized = _normalize_thinking_blocks(normalized)
-                # Normalize stop_reason for non-streaming responses too
-                if "stop_reason" in normalized:
-                    normalized["stop_reason"] = _normalize_stop_reason(
-                        normalized.get("stop_reason"), normalized.get("content")
-                    )
-                return Response(
-                    content=json.dumps(normalized, ensure_ascii=False).encode("utf-8"),
-                    status_code=r.status_code,
-                    media_type=content_type,
-                )
-            except Exception:
-                pass  # Fall through to return raw response
+    body = dict(json_body)
+    accumulated_msg: Dict[str, Any] | None = None
+    accumulated_usage: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
 
-        return Response(content=r.content, status_code=r.status_code, media_type=content_type)
+    for attempt in range(_MAX_CONTINUATION_RETRIES + 1):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=headers, json=body)
+            content_type = r.headers.get("content-type", "application/json")
+            logger.info(
+                "_proxy_json attempt=%d/%d status=%s",
+                attempt + 1, _MAX_CONTINUATION_RETRIES + 1, r.status_code
+            )
+
+            # Normalize tool responses for successful JSON responses
+            if r.status_code < 400 and "application/json" in content_type:
+                try:
+                    msg = r.json()
+                    # Execute server-side tool calls (web_search, etc.) if present
+                    if server_tool_names:
+                        msg = await _execute_server_tool_calls(
+                            msg, server_tool_names, body, url, headers,
+                        )
+
+                    # Merge accumulated content if this is a continuation
+                    if accumulated_msg is not None:
+                        prev_content = accumulated_msg.get("content") or []
+                        new_content = msg.get("content") or []
+                        if isinstance(prev_content, list) and isinstance(new_content, list):
+                            msg["content"] = prev_content + new_content
+                        # Merge usage
+                        usage = msg.get("usage") or {}
+                        accumulated_usage["input_tokens"] += usage.get("input_tokens", 0)
+                        accumulated_usage["output_tokens"] += usage.get("output_tokens", 0)
+                        msg["usage"] = accumulated_usage
+                    else:
+                        # First attempt - capture initial usage
+                        usage = msg.get("usage") or {}
+                        accumulated_usage = {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                        }
+
+                    # Check if response is incomplete and we should continue
+                    if _is_message_incomplete(msg) and attempt < _MAX_CONTINUATION_RETRIES:
+                        logger.info("Detected incomplete response in _proxy_json, continuing (attempt %d/%d)",
+                                   attempt + 1, _MAX_CONTINUATION_RETRIES)
+                        accumulated_msg = msg
+                        # Build continuation request
+                        body = _build_continuation_request(json_body, msg.get("content", []))
+                        continue
+
+                    # Response is complete or exhausted retries - normalize and return
+                    normalized = _normalize_tool_response(msg, request_tools)
+                    normalized = _normalize_thinking_blocks(normalized)
+                    # Normalize stop_reason for non-streaming responses too
+                    if "stop_reason" in normalized:
+                        normalized["stop_reason"] = _normalize_stop_reason(
+                            normalized.get("stop_reason"), normalized.get("content")
+                        )
+                    return Response(
+                        content=json.dumps(normalized, ensure_ascii=False).encode("utf-8"),
+                        status_code=r.status_code,
+                        media_type=content_type,
+                    )
+                except Exception:
+                    pass  # Fall through to return raw response
+
+            # Error or non-JSON response - don't retry
+            return Response(content=r.content, status_code=r.status_code, media_type=content_type)
+
+    # Should not reach here, but just in case
+    return Response(content=b"{}", status_code=200, media_type="application/json")
 
 
 async def _proxy_stream_passthrough(url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> StreamingResponse:
     """
     Pass-through upstream streaming bytes.
     """
-    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
+    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
 
     async def gen() -> AsyncIterator[bytes]:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -720,7 +886,7 @@ async def _proxy_stream_emulated_from_nonstream(
       - Execute any server-side tool calls (web_search, etc.)
       - Convert the final JSON response into Anthropic SSE events
     """
-    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30.0)
+    timeout = httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
     request_tools = json_body.get("tools") if isinstance(json_body, dict) else None
 
     async def gen() -> AsyncIterator[bytes]:
@@ -728,45 +894,87 @@ async def _proxy_stream_emulated_from_nonstream(
         body2 = dict(json_body)
         body2["stream"] = False
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, json=body2)
-            ct = (r.headers.get("content-type") or "").lower()
-            logger.info("Upstream nonstream-for-emulated status=%s content-type=%s url=%s", r.status_code, ct, url)
+        accumulated_msg: Dict[str, Any] | None = None
+        accumulated_usage: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
 
-            if r.status_code >= 400:
-                # Emit an SSE "error" frame with the upstream body (best-effort).
+        for attempt in range(_MAX_CONTINUATION_RETRIES + 1):
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, json=body2)
+                ct = (r.headers.get("content-type") or "").lower()
+                logger.info(
+                    "Upstream nonstream-for-emulated attempt=%d/%d status=%s content-type=%s url=%s",
+                    attempt + 1, _MAX_CONTINUATION_RETRIES + 1, r.status_code, ct, url
+                )
+
+                if r.status_code >= 400:
+                    # Emit an SSE "error" frame with the upstream body (best-effort).
+                    try:
+                        payload = r.json()
+                    except Exception:
+                        payload = {"raw": r.text}
+                    yield _sse("error", {"type": "error", "error": payload})
+                    yield _sse("message_stop", {"type": "message_stop"})
+                    return
+
                 try:
-                    payload = r.json()
+                    msg = r.json()
                 except Exception:
-                    payload = {"raw": r.text}
-                yield _sse("error", {"type": "error", "error": payload})
-                yield _sse("message_stop", {"type": "message_stop"})
-                return
+                    # If upstream didn't return JSON, emit as an error.
+                    yield _sse("error", {"type": "error", "error": {"raw": r.text}})
+                    yield _sse("message_stop", {"type": "message_stop"})
+                    return
 
-            try:
-                msg = r.json()
-            except Exception:
-                # If upstream didn't return JSON, emit as an error.
-                yield _sse("error", {"type": "error", "error": {"raw": r.text}})
-                yield _sse("message_stop", {"type": "message_stop"})
-                return
+            # Execute server-side tool calls (web_search, etc.)
+            if server_tool_names:
+                msg = await _execute_server_tool_calls(
+                    msg, server_tool_names, body2, url, headers,
+                )
 
-        # Execute server-side tool calls (web_search, etc.)
-        if server_tool_names:
-            msg = await _execute_server_tool_calls(
-                msg, server_tool_names, json_body, url, headers,
-            )
+            # Merge accumulated content if this is a continuation
+            if accumulated_msg is not None:
+                prev_content = accumulated_msg.get("content") or []
+                new_content = msg.get("content") or []
+                if isinstance(prev_content, list) and isinstance(new_content, list):
+                    msg["content"] = prev_content + new_content
+                # Merge usage
+                usage = msg.get("usage") or {}
+                accumulated_usage["input_tokens"] += usage.get("input_tokens", 0)
+                accumulated_usage["output_tokens"] += usage.get("output_tokens", 0)
+                msg["usage"] = accumulated_usage
+            else:
+                # First attempt - capture initial usage
+                usage = msg.get("usage") or {}
+                accumulated_usage = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                }
+
+            # Check if response is incomplete and we should continue
+            if _is_message_incomplete(msg) and attempt < _MAX_CONTINUATION_RETRIES:
+                logger.info("Detected incomplete response, will retry with continuation (attempt %d/%d)",
+                           attempt + 1, _MAX_CONTINUATION_RETRIES)
+                accumulated_msg = msg
+                # Build continuation request
+                body2 = _build_continuation_request(json_body, msg.get("content", []))
+                body2["stream"] = False
+                continue
+
+            # Response is complete or we've exhausted retries
+            accumulated_msg = msg
+            break
 
         # Log upstream response metadata
-        content_types = [b.get("type") for b in (msg.get("content") or []) if isinstance(b, dict)]
+        final_msg = accumulated_msg or {}
+        content_types = [b.get("type") for b in (final_msg.get("content") or []) if isinstance(b, dict)]
         logger.info(
-            "Upstream response: stop_reason=%s content_types=%s output_tokens=%s",
-            msg.get("stop_reason"),
+            "Upstream response: stop_reason=%s content_types=%s output_tokens=%s (after %d attempts)",
+            final_msg.get("stop_reason"),
             content_types,
-            (msg.get("usage") or {}).get("output_tokens"),
+            (final_msg.get("usage") or {}).get("output_tokens"),
+            attempt + 1,
         )
 
-        async for ev in _emulate_anthropic_sse_from_message(msg, request_tools):
+        async for ev in _emulate_anthropic_sse_from_message(final_msg, request_tools):
             yield ev
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -826,7 +1034,7 @@ async def messages(
         server_tool_names or None,
     )
 
-    if os.getenv("LOG_BODY", "0") == "1":
+    if _CONFIG.get("log_body", False):
         logger.info("Body: %s", json.dumps(body, indent=2)[:20000])
 
     if stream:
@@ -857,7 +1065,7 @@ async def count_tokens(
     if isinstance(body.get("tools"), list) and body["tools"]:
         body["tools"], _ = _convert_server_tools(body["tools"])
 
-    if os.getenv("LOG_TOKENS", "0") == "1":
+    if _CONFIG.get("log_tokens", False):
         logger.info("COUNT_TOKENS REQUEST: %s", json.dumps(body, indent=2)[:20000])
     else:
         logger.info("COUNT_TOKENS model=%s tools=%s", body.get("model"), len(body.get("tools") or []))

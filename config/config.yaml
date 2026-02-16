@@ -1,0 +1,30 @@
+# Claude Swap Shim Configuration
+
+# Server settings
+host: "127.0.0.1"
+port: 4001
+
+# Upstream LiteLLM settings
+upstream_base_url: "http://127.0.0.1:4000"
+upstream_timeout: 600
+connect_timeout: 30
+
+# Auto-retry settings
+# Maximum retries for incomplete responses (kimi-k2.5 sometimes stalls mid-generation)
+max_continuation_retries: 3
+
+# Streaming settings
+# Emulate streaming for tool calls by doing upstream stream=false and re-wrapping into SSE
+emulate_stream_for_tools: true
+
+# Model settings
+# Default model name to normalize all requests to
+default_model: "kimi-k2.5"
+
+# Web search settings
+enable_web_search: true
+web_search_max_results: 5
+
+# Debug settings
+log_body: false
+log_tokens: false

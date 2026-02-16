@@ -24,7 +24,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -130,18 +129,60 @@ def runtime_paths() -> RuntimePaths:
 
 
 def _packaged_litellm_template() -> str:
-    return resources.files("claude_swap.data").joinpath("litellm.yaml").read_text(encoding="utf-8")
+    """Read template from ./config/litellm.yaml or fallback to embedded default."""
+    project_template = Path.cwd() / "config" / "litellm.yaml"
+    if project_template.exists():
+        return project_template.read_text(encoding="utf-8")
+    # Fallback: embedded default
+    return _default_litellm_template()
+
+
+def _default_litellm_template() -> str:
+    """Return embedded default litellm config."""
+    return '''model_list:
+  - model_name: kimi-k2.5
+    litellm_params:
+      model: bedrock/moonshotai.kimi-k2.5
+      custom_llm_provider: bedrock
+      aws_region_name: us-east-1
+      allowed_openai_params: ["reasoning_effort", "tools", "tool_choice"]
+    model_info:
+      mode: completion
+
+litellm_settings:
+  modify_params: true
+  log_responses: true
+'''
+
+
+def _project_litellm_config() -> Path | None:
+    """Look for project-local config/litellm.yaml if it exists."""
+    project_config = Path.cwd() / "config" / "litellm.yaml"
+    if project_config.exists():
+        return project_config
+    return None
 
 
 def ensure_litellm_config() -> Path:
-    """Ensure user-local litellm config exists and return its path."""
-    litellm_config = _config_dir() / "litellm.yaml"
-    litellm_config.parent.mkdir(parents=True, exist_ok=True)
+    """Return the litellm config path.
 
-    if not litellm_config.exists():
-        litellm_config.write_text(_packaged_litellm_template(), encoding="utf-8")
+    Priority:
+    1. ./config/litellm.yaml (project-local, if exists)
+    2. ~/.config/claude-swap/litellm.yaml (user config, created from template if missing)
+    """
+    # Check for project-local config first
+    project_config = _project_litellm_config()
+    if project_config:
+        return project_config
 
-    return litellm_config
+    # Fall back to user config
+    user_config = _config_dir() / "litellm.yaml"
+    user_config.parent.mkdir(parents=True, exist_ok=True)
+
+    if not user_config.exists():
+        user_config.write_text(_packaged_litellm_template(), encoding="utf-8")
+
+    return user_config
 
 
 def _port_listening(host: str, port: int, timeout_s: float = 1.0) -> bool:
@@ -466,14 +507,19 @@ def run_doctor(settings: Settings, paths: RuntimePaths | None = None) -> bool:
     config_path = _config_file()
     checks.append(("config file", config_path.exists(), str(config_path)))
 
-    template_ok = True
+    litellm_ok = True
     try:
-        ensure_litellm_config()
-        template_msg = str(_config_dir() / "litellm.yaml")
+        litellm_path = ensure_litellm_config()
+        # Show if using project-local or user config
+        project_config = _project_litellm_config()
+        if project_config:
+            litellm_msg = f"{litellm_path} (project-local)"
+        else:
+            litellm_msg = f"{litellm_path} (user)"
     except Exception as exc:
-        template_ok = False
-        template_msg = str(exc)
-    checks.append(("litellm config", template_ok, template_msg))
+        litellm_ok = False
+        litellm_msg = str(exc)
+    checks.append(("litellm config", litellm_ok, litellm_msg))
 
     data_dir_ok = paths.base_dir.exists() and os.access(paths.base_dir, os.W_OK)
     checks.append(("runtime dir writable", data_dir_ok, str(paths.base_dir)))

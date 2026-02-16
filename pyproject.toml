@@ -58,7 +58,6 @@ Issues = "https://github.com/jswift24/claude-swap/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["claude_swap"]
 only-include = ["src/claude_swap"]
-force-include = { "src/claude_swap/data/litellm.yaml" = "claude_swap/data/litellm.yaml" }
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
